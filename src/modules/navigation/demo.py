@@ -362,4 +362,3 @@ class RobotController:
 
 if __name__ == '__main__':
     RobotController().run()
-```
