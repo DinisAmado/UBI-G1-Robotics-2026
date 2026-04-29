@@ -196,68 +196,30 @@ def conversar(historico: list) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 def gravar() -> Optional[str]:
     """
-    Recebe áudio do G1 via ZMQ e guarda em WAV
-    Compatível com Whisper (igual ao microfone antigo)
+    Usa um ficheiro MP4 como fonte de áudio (para testes)
     """
 
-    ctx = zmq.Context()
-    sock = ctx.socket(zmq.SUB)
-    sock.connect(f"tcp://{G1_IP}:{PORT}")
-    sock.setsockopt(zmq.SUBSCRIBE, AUDIO_TOPIC)
+    mp4_file = "IMG_7192.mp4"
+    wav_file = AUDIO_TEMP
 
-    print("\nÀ escuta (microfone do G1)...")
+    print(f"\n[AUDIO TEST] A usar ficheiro: {mp4_file}")
 
-    audio_buffer = bytearray()
-    last_sr = 48000
-    last_ch = 1
-
-    start_time = time.time()
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", mp4_file,
+        "-vn",              # remove vídeo
+        "-acodec", "pcm_s16le",
+        "-ar", "16000",     # bom padrão para Whisper
+        "-ac", "1",
+        wav_file
+    ]
 
     try:
-        while time.time() - start_time < RECORD_SECONDS:
-            try:
-                parts = sock.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.Again:
-                continue
-
-            if parts[0] != AUDIO_TOPIC:
-                continue
-
-            # parsing robusto (igual ao teu outro código)
-            if len(parts) == 3:
-                _, header, pcm_compressed = parts
-            else:
-                _, header, *rest = parts
-                pcm_compressed = b"".join(rest)
-
-            sr = int.from_bytes(header[:4], "little")
-            ch = header[4]
-
-            try:
-                pcm = lz4.frame.decompress(pcm_compressed)
-            except Exception:
-                continue
-
-            last_sr = sr
-            last_ch = ch
-            audio_buffer.extend(pcm)
-
-        if not audio_buffer:
-            print("Sem áudio recebido.")
-            return None
-
-        # guardar WAV
-        with wave.open(AUDIO_TEMP, "wb") as wf:
-            wf.setnchannels(last_ch)
-            wf.setsampwidth(2)  # int16
-            wf.setframerate(last_sr)
-            wf.writeframes(audio_buffer)
-
-        return AUDIO_TEMP
-
-    finally:
-        sock.close()
-        ctx.term()
+        subprocess.check_call(cmd)
+        return wav_file
+    except Exception as e:
+        print(f"[ERRO ffmpeg] {e}")
+        return None
 
 
 def falar(texto: str) -> None:
