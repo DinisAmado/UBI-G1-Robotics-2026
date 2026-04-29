@@ -62,12 +62,13 @@ def sensor_real(
 
     obstacle_points = []
     free_points = []
-
-    if state is None:
-        return obstacle_points, free_points
-
-    if not hasattr(state, "lidar"):
-        return obstacle_points, free_points
+    
+    print("DEBUG sensor_real chamado")
+    print("state is None?", state is None)
+    
+    if state is not None:
+        print("state tem lidar?", hasattr(state, "lidar"))
+        print("campos do state:", dir(state))
 
     lidar = state.lidar
 
