@@ -21,6 +21,7 @@ import unicodedata
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
+import subprocess
 
 # ── Listar microfones e sair ───────────────────────────────────────────────────
 if "--list-mics" in sys.argv:
