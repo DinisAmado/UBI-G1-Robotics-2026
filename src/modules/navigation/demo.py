@@ -1,50 +1,58 @@
-#demo.py
+"""
+demo.py
 
+1 - Em simulação:
+    abrir terminal e correr:
+        python3 demo.py
+    noutro terminal:
+        ./arranca.sh
+
+2 - No robô real:
+    correr com a interface correta:
+        python3 demo.py eth0
+    ou:
+        python3 demo.py enp...
 """
-exemplo básico de como controlar o robô:
-1-abrir um terminal e correr este script com
-python3 demo.py
-2-noutro terminal correr ./arranca.sh
-"""
+
 import os
 import json
 import time
 import sys
 import math
-import json
 import numpy as np
+
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
+
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.utils.crc import CRC
-from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
 
 from slam_navigation import SLAMNavigation
-from sensores import sensor_sim, sensor_real
+from sensores import sensor_mujoco_json, sensor_real
+
 
 # ---------------------------------------------------------------
-# Configurações do Mapa
+# Configurações do mapa
 # ---------------------------------------------------------------
-MAP_ORIGIN_X = -40.0  # Centrado para permitir 40m em todas as direções
-MAP_ORIGIN_Y = -40.0
-MAP_RESOLUTION = 0.1
+MAP_ORIGIN_X = -5.0
+MAP_ORIGIN_Y = -5.0
+MAP_RESOLUTION = 0.05
+
 
 def world_to_cell(world_x, world_y):
-    """Converte coordenadas do mundo (metros) para células do grid."""
     cell_x = int((world_x - MAP_ORIGIN_X) / MAP_RESOLUTION)
     cell_y = int((world_y - MAP_ORIGIN_Y) / MAP_RESOLUTION)
     return cell_x, cell_y
 
 
 def cell_to_world(cell_x, cell_y):
-    """Converte células do grid para coordenadas do mundo em metros."""
     world_x = MAP_ORIGIN_X + cell_x * MAP_RESOLUTION
     world_y = MAP_ORIGIN_Y + cell_y * MAP_RESOLUTION
     return world_x, world_y
@@ -57,15 +65,6 @@ def find_approach_goal(
     target_distance_m=0.30,
     tolerance_m=0.10
 ):
-    """
-    Escolhe automaticamente uma célula livre perto da mesa.
-
-    A ideia é:
-    - a mesa está no centro table_cell;
-    - o robô deve parar a aproximadamente target_distance_m da mesa;
-    - escolhemos uma célula livre nesse anel;
-    - preferimos células próximas da distância desejada e próximas do robô.
-    """
     tx, ty = table_cell
     rx, ry = robot_cell
 
@@ -94,7 +93,6 @@ def find_approach_goal(
                 continue
 
             dist_to_robot = math.sqrt((gx - rx) ** 2 + (gy - ry) ** 2)
-
             score = abs(dist_to_table - target_cells) + 0.05 * dist_to_robot
 
             candidates.append((score, gx, gy))
@@ -106,42 +104,11 @@ def find_approach_goal(
     return candidates[0][1], candidates[0][2]
 
 
-def save_outputs(output_dir, slam, path, goal_cell, custom_cmap):
-    os.makedirs(output_dir, exist_ok=True)
-
-    np.save(
-        os.path.join(output_dir, "occupancy_grid.npy"),
-        slam.get_probability_grid()
-    )
-
-    plt.imsave(
-        os.path.join(output_dir, "map_preview.png"),
-        slam.get_visualization_grid(),
-        cmap=custom_cmap,
-        vmin=0,
-        vmax=2
-    )
-
-    path_data = {
-        "goal_cell": None if goal_cell is None else {
-            "x": int(goal_cell[0]),
-            "y": int(goal_cell[1])
-        },
-        "path": [
-            {"x": int(p[0]), "y": int(p[1])}
-            for p in path
-        ]
-    }
-
-    with open(os.path.join(output_dir, "latest_path.json"), "w") as f:
-        json.dump(path_data, f, indent=2)
-
-
 class RobotController:
     def __init__(self):
         self.current_state = None
         self.crc = CRC()
-        # Posição real do robô em metros (lida do MuJoCo via JSON)
+
         self.pos_x = 0.0
         self.pos_y = 0.0
 
@@ -149,14 +116,12 @@ class RobotController:
         self.current_state = msg
 
     def run(self):
-        # Fecha janelas de visualização anteriores
         plt.close('all')
 
-        # Inicializar comunicação
         if len(sys.argv) < 2:
-            ChannelFactoryInitialize(1, "lo")  # Simulação
+            ChannelFactoryInitialize(1, "lo")
         else:
-            ChannelFactoryInitialize(0, sys.argv[1])  # Robô real
+            ChannelFactoryInitialize(0, sys.argv[1])
 
         low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
         low_state_sub.Init(self.LowStateHandler, 10)
@@ -164,33 +129,50 @@ class RobotController:
         low_cmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
         low_cmd_pub.Init()
 
-        print("Waiting for simulator...")
+        print("Waiting for lowstate...")
+
+        timeout = 5
+        start_time = time.time()
+
         while self.current_state is None:
+            if time.time() - start_time > timeout:
+                print("Aviso: não recebi lowstate. Vou continuar sem bloquear.")
+                break
             time.sleep(0.01)
-        print("Connected")
+
+        print("Continuing...")
 
         # ---------------- SLAM e Navegação ----------------
-        slam = SLAMNavigation(map_size=800, resolution=0.1, num_rays=144, max_range=400)
+        slam = SLAMNavigation(
+            map_size=200,
+            resolution=MAP_RESOLUTION,
+            num_rays=144,
+            max_range=100
+        )
 
         output_dir = "outputs"
         os.makedirs(output_dir, exist_ok=True)
 
-        # Configurar Objetivo: Mesa em [2.0, 0.0] no mundo MuJoCo
-        table_world = [2.0, 0.0]  # Centro da mesa no MuJoCo
-        table_cell = world_to_cell(table_world[0], table_world[1])
-        goal_cell = None
+        # ---------------------------------------------------
+        # Objetivo inicial
+        # No robô real começa sem objetivo conhecido.
+        # A perceção/interação deverá preencher isto depois.
+        # ---------------------------------------------------
+        table_world = None
+        table_cell = None
+        current_goal_cell = None
+        current_path = []
 
         # Posição inicial
-        self.pos_x = 0.0
-        self.pos_y = 0.0
         init_cell_x, init_cell_y = world_to_cell(self.pos_x, self.pos_y)
         slam.update_pose(init_cell_x, init_cell_y, 0.0)
 
-        # ---------------- Visualização Única ----------------
+        # ---------------- Visualização ----------------
         custom_cmap = ListedColormap(['white', 'lightgrey', 'black'])
 
         plt.ion()
         fig, ax = plt.subplots(figsize=(10, 8))
+
         img = ax.imshow(
             slam.get_visualization_grid(),
             cmap=custom_cmap,
@@ -199,16 +181,13 @@ class RobotController:
             origin="lower"
         )
 
-
-        # Criar elementos da legenda
         leg_free = mpatches.Patch(color='white', label='Livre', ec='black')
-        leg_unk  = mpatches.Patch(color='lightgrey', label='Desconhecido')
-        leg_obs  = mpatches.Patch(color='black', label='Obstáculo')
-
+        leg_unk = mpatches.Patch(color='lightgrey', label='Desconhecido')
+        leg_obs = mpatches.Patch(color='black', label='Obstáculo')
 
         robot_dot, = ax.plot([], [], "ro", markersize=8, label="Robô G1")
         path_line, = ax.plot([], [], "g-", linewidth=2, label="Caminho A*")
-        goal_dot, = ax.plot([], [], "bo", markersize=6, label="Objetivo automático")
+        goal_dot, = ax.plot([], [], "bo", markersize=6, label="Objetivo")
 
         ax.set_title("SLAM e Navegação")
         ax.legend(
@@ -216,71 +195,89 @@ class RobotController:
             loc='upper right',
             fontsize='small'
         )
-        plt.show(block=False)
 
-        # FORÇAR ABERTURA DA JANELA
+        plt.show(block=False)
         plt.pause(0.1)
 
         viz_counter = 0
         last_map_save_time = 0.0
-        last_path_save_time = 0.0
         last_saved_path = None
-
         MAP_SAVE_INTERVAL = 2.0
 
-        current_path = []
-        current_goal_cell = None
         while True:
             step_start = time.perf_counter()
-            # Obter orientação (Yaw)
+
+            yaw = 0.0
+
             if self.current_state and hasattr(self.current_state, 'imu_state'):
                 yaw = self.current_state.imu_state.rpy[2]
-            else:
-                yaw = 0.0
 
-            try:
-                with open("/tmp/mujoco_rays.json", "r") as f:
-                    ray_data = json.load(f)
-                self.pos_x = ray_data["robot_world_x"]
-                self.pos_y = ray_data["robot_world_y"]
-                yaw = ray_data["yaw"]
-                slam.update_from_mujoco_rays(ray_data["rays"])
-            except Exception:
-                cx, cy = world_to_cell(self.pos_x, self.pos_y)
-                obs, free = sensor_sim(cx, cy, yaw, max_range=400, map_size=800)
-                for pt in obs: slam._update_cell(pt[0], pt[1], True)
-                for pt in free: slam._update_cell(pt[0], pt[1], False)
+            # ---------------------------------------------------
+            # 1. Tentar ler dados do MuJoCo
+            # ---------------------------------------------------
+            mujoco_ok, mx, my, myaw, rays = sensor_mujoco_json()
+
+            if mujoco_ok:
+                self.pos_x = mx
+                self.pos_y = my
+                yaw = myaw
+                slam.update_from_mujoco_rays(rays)
+
+            else:
+                # ---------------------------------------------------
+                # 2. Robô real: tentar usar LiDAR real
+                # ---------------------------------------------------
+                curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
+
+                obs, free = sensor_real(
+                    self.current_state,
+                    curr_cell_x,
+                    curr_cell_y,
+                    yaw,
+                    map_size=slam.map_size,
+                    resolution=MAP_RESOLUTION,
+                    max_range_meters=5.0
+                )
+
+                for pt in obs:
+                    slam._update_cell(pt[0], pt[1], True)
+
+                for pt in free:
+                    slam._update_cell(pt[0], pt[1], False)
 
             curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
             slam.update_pose(curr_cell_x, curr_cell_y, yaw)
 
-
-            # ---- Atualizar Visualização (a cada 50 iterações) ----
+            # ---------------------------------------------------
+            # Visualização e planeamento
+            # ---------------------------------------------------
             viz_counter += 1
+
             if viz_counter >= 20:
                 viz_counter = 0
 
-                # Planeamento de Caminho A*
-                # Recalcular caminho apenas se:
-                # - ainda não existe caminho
-                # - o caminho atual ficou inválido por novo obstáculo
                 path_needs_replan = not current_path or not slam.is_path_valid(current_path)
 
                 if path_needs_replan:
-                    current_goal_cell = find_approach_goal(
-                        slam=slam,
-                        table_cell=table_cell,
-                        robot_cell=(curr_cell_x, curr_cell_y),
-                        target_distance_m=0.30,
-                        tolerance_m=0.10
-                    )
 
-                    if current_goal_cell is not None:
-                        current_path = slam.plan_path(current_goal_cell)
+                    if table_cell is not None:
+                        current_goal_cell = find_approach_goal(
+                            slam=slam,
+                            table_cell=table_cell,
+                            robot_cell=(curr_cell_x, curr_cell_y),
+                            target_distance_m=0.30,
+                            tolerance_m=0.10
+                        )
+
+                        if current_goal_cell is not None:
+                            current_path = slam.plan_path(current_goal_cell)
+                        else:
+                            current_path = []
+
                     else:
+                        current_goal_cell = None
                         current_path = []
 
-                # Atualizar Grid
                 img.set_data(slam.get_visualization_grid())
 
                 if current_path:
@@ -290,7 +287,6 @@ class RobotController:
                 else:
                     path_line.set_data([], [])
 
-                # Atualizar a posição do robô (ponto vermelho)
                 robot_dot.set_data([curr_cell_y], [curr_cell_x])
 
                 if current_goal_cell is not None:
@@ -298,7 +294,6 @@ class RobotController:
                 else:
                     goal_dot.set_data([], [])
 
-                # Zoom e Desenho
                 ax.set_xlim(curr_cell_y - 100, curr_cell_y + 100)
                 ax.set_ylim(curr_cell_x - 100, curr_cell_x + 100)
 
@@ -324,35 +319,37 @@ class RobotController:
 
                     last_map_save_time = now
 
-                if current_path:
-                    path_changed = current_path != last_saved_path
-                    if path_changed:
-                        path_data = {
-                            "goal_cell": {
-                                "x": int(current_goal_cell[0]),
-                                "y": int(current_goal_cell[1])
-                            },
-                            "goal_world": {
-                                "x": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[0]),
-                                "y": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[1])
-                            },
-                            "path": [
-                                {
-                                    "cell_x": int(p[0]),
-                                    "cell_y": int(p[1]),
-                                    "world_x": float(cell_to_world(p[0], p[1])[0]),
-                                    "world_y": float(cell_to_world(p[0], p[1])[1])
-                                }
-                                for p in current_path
-                            ]
-                        }
+                if current_path and current_path != last_saved_path:
+                    path_data = {
+                        "goal_cell": {
+                            "x": int(current_goal_cell[0]),
+                            "y": int(current_goal_cell[1])
+                        },
+                        "goal_world": {
+                            "x": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[0]),
+                            "y": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[1])
+                        },
+                        "path": [
+                            {
+                                "cell_x": int(p[0]),
+                                "cell_y": int(p[1]),
+                                "world_x": float(cell_to_world(p[0], p[1])[0]),
+                                "world_y": float(cell_to_world(p[0], p[1])[1])
+                            }
+                            for p in current_path
+                        ]
+                    }
 
-                        with open(os.path.join(output_dir, "latest_path.json"), "w") as f:
-                            json.dump(path_data, f, indent=2)
+                    with open(os.path.join(output_dir, "latest_path.json"), "w") as f:
+                        json.dump(path_data, f, indent=2)
 
-                        last_saved_path = list(current_path)
-                        last_path_save_time = now
+                    last_saved_path = list(current_path)
 
+            # ---------------------------------------------------
+            # Segurança: por agora não enviar movimento real.
+            # Mantemos LowCmd vazio como heartbeat/comunicação.
+            # Para teste totalmente passivo, comenta estas 3 linhas.
+            # ---------------------------------------------------
             cmd = unitree_hg_msg_dds__LowCmd_()
             cmd.crc = self.crc.Crc(cmd)
             low_cmd_pub.Write(cmd)
@@ -365,3 +362,4 @@ class RobotController:
 
 if __name__ == '__main__':
     RobotController().run()
+```
