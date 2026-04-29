@@ -200,8 +200,10 @@ def gravar() -> Optional[str]:
     Usa um ficheiro MP4 como fonte de áudio (para testes)
     """
 
-    mp4_file = "IMG_7192.mp4"
+    mp4_file = os.path.join(os.path.dirname(__file__), "IMG_7192.mp4")
     wav_file = AUDIO_TEMP
+    print("Caminho completo:", os.path.abspath(mp4_file))
+    print("Existe ficheiro?", os.path.exists(mp4_file))
 
     print(f"\n[AUDIO TEST] A usar ficheiro: {mp4_file}")
 
@@ -401,7 +403,7 @@ def main():
             finally:
                 if os.path.exists(ficheiro):
                     os.remove(ficheiro)
-
+            break
     except KeyboardInterrupt:
         print("\n\nA desligar o Johnny... Até logo!")
 
