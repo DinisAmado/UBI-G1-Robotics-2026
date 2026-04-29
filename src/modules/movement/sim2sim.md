@@ -52,7 +52,7 @@ O MuJoCo é a única biblioteca extra necessária para gerar o mundo 3D (em prin
 pip install mujoco
 ```
 
-## 5. Iniciar a Simulação 🚀
+## 5. Iniciar a Simulação
 Navega para a pasta principal e lança o robô. Ele vai carregar automaticamente o cérebro `motion.pt` oficial da Unitree.
 ```bash
 cd ~/unitree_rl_gym
