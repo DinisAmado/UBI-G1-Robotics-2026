@@ -31,7 +31,6 @@ if "--list-mics" in sys.argv:
     sys.exit(0)
 
 import pygame
-import speech_recognition as sr
 from faster_whisper import WhisperModel
 import edge_tts
 import ollama as ollama_client
@@ -50,8 +49,8 @@ import time
 # ══════════════════════════════════════════════════════════════════════════════
 WHISPER_MODEL    = "medium"         # "small" (rápido) ou "medium" (mais preciso para PT)
 OLLAMA_MODEL     = "qwen2.5:1.5b"  # modelo de conversa
-MIC_DEVICE_INDEX = None             # None = microfone padrão. Muda para 0,1,2... se falhar
-MIC_THRESHOLD    = 1500             # Aumenta se ouvir ruído, baixa se não detetar voz
+#MIC_DEVICE_INDEX = None             # None = microfone padrão. Muda para 0,1,2... se falhar
+#MIC_THRESHOLD    = 1500             # Aumenta se ouvir ruído, baixa se não detetar voz
 TOPIC_NAME       = "HRICommands"
 AUDIO_TEMP       = "temp_hri.wav"
 AUDIO_RESP       = "resposta_hri.mp3"
