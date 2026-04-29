@@ -41,6 +41,10 @@ from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
 
 
+import zmq
+import lz4.frame
+import wave
+import time
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURAÇÃO
 # ══════════════════════════════════════════════════════════════════════════════
@@ -51,6 +55,14 @@ MIC_THRESHOLD    = 1500             # Aumenta se ouvir ruído, baixa se não det
 TOPIC_NAME       = "HRICommands"
 AUDIO_TEMP       = "temp_hri.wav"
 AUDIO_RESP       = "resposta_hri.mp3"
+
+
+AUDIO_TOPIC = b"g1_audio"
+G1_IP = "192.168.123.164"
+PORT = 5556
+
+ZMQ_TIMEOUT = 5
+RECORD_SECONDS = 4
 
 # Ações que precisam de confirmação antes de publicar no DDS
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
@@ -184,21 +196,69 @@ def conversar(historico: list) -> str:
 # 4. ÁUDIO
 # ══════════════════════════════════════════════════════════════════════════════
 def gravar() -> Optional[str]:
-    r = sr.Recognizer()
-    r.dynamic_energy_threshold = False  # CRÍTICO: não deixar calibrar para ~6
-    r.energy_threshold = MIC_THRESHOLD
-    r.pause_threshold = 1.2
+    """
+    Recebe áudio do G1 via ZMQ e guarda em WAV
+    Compatível com Whisper (igual ao microfone antigo)
+    """
 
-    with sr.Microphone(device_index=MIC_DEVICE_INDEX) as source:
-        print(f"\nÀ escuta... fala agora!")
-        try:
-            audio = r.listen(source, timeout=10, phrase_time_limit=12)
-            with open(AUDIO_TEMP, "wb") as f:
-                f.write(audio.get_wav_data())
-            return AUDIO_TEMP
-        except sr.WaitTimeoutError:
-            print("Timeout — ninguém falou.")
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.SUB)
+    sock.connect(f"tcp://{G1_IP}:{PORT}")
+    sock.setsockopt(zmq.SUBSCRIBE, AUDIO_TOPIC)
+
+    print("\nÀ escuta (microfone do G1)...")
+
+    audio_buffer = bytearray()
+    last_sr = 48000
+    last_ch = 1
+
+    start_time = time.time()
+
+    try:
+        while time.time() - start_time < RECORD_SECONDS:
+            try:
+                parts = sock.recv_multipart(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+
+            if parts[0] != AUDIO_TOPIC:
+                continue
+
+            # parsing robusto (igual ao teu outro código)
+            if len(parts) == 3:
+                _, header, pcm_compressed = parts
+            else:
+                _, header, *rest = parts
+                pcm_compressed = b"".join(rest)
+
+            sr = int.from_bytes(header[:4], "little")
+            ch = header[4]
+
+            try:
+                pcm = lz4.frame.decompress(pcm_compressed)
+            except Exception:
+                continue
+
+            last_sr = sr
+            last_ch = ch
+            audio_buffer.extend(pcm)
+
+        if not audio_buffer:
+            print("Sem áudio recebido.")
             return None
+
+        # guardar WAV
+        with wave.open(AUDIO_TEMP, "wb") as wf:
+            wf.setnchannels(last_ch)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(last_sr)
+            wf.writeframes(audio_buffer)
+
+        return AUDIO_TEMP
+
+    finally:
+        sock.close()
+        ctx.term()
 
 
 def falar(texto: str) -> None:
