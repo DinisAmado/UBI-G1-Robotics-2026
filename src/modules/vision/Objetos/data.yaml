@@ -1,0 +1,13 @@
+# Caminho absoluto ou relativo para a pasta do dataset
+path: ./train_data
+
+# Caminhos para as imagens (relativos ao 'path' acima)
+train: images/train
+val: images/val
+
+# Dicionário de classes (IDs do seu JSON)
+names:
+  0: objects
+  1: bola
+  2: cubo
+  3: pasta

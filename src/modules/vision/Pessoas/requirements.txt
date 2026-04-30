@@ -1,0 +1,6 @@
+insightface==0.7.3
+mediapipe_silicon==0.9.2.1
+numpy==2.4.4
+opencv_contrib_python==4.13.0.92
+opencv_python==4.11.0.86
+opencv_python_headless==4.13.0.92
