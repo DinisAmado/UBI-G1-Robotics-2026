@@ -35,7 +35,8 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
 
 from slam_navigation import SLAMNavigation
-from sensores import sensor_mujoco_json, sensor_real
+from sensores import sensor_mujoco_json, pointcloud_to_occupancy_points
+from livox_receiver import LivoxReceiver
 
 
 # ---------------------------------------------------------------
@@ -118,10 +119,15 @@ class RobotController:
     def run(self):
         plt.close('all')
 
-        if len(sys.argv) < 2:
-            ChannelFactoryInitialize(1, "lo")
+        real_robot = len(sys.argv) >= 2
+
+        if real_robot:
+            interface = sys.argv[1]
+            print(f"Modo robô real na interface: {interface}")
+            ChannelFactoryInitialize(0, interface)
         else:
-            ChannelFactoryInitialize(0, sys.argv[1])
+            print("Modo simulação")
+            ChannelFactoryInitialize(1, "lo")
 
         low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
         low_state_sub.Init(self.LowStateHandler, 10)
@@ -149,6 +155,18 @@ class RobotController:
             num_rays=144,
             max_range=100
         )
+
+
+        lidar = None
+
+        if real_robot:
+            print("A iniciar Livox MID-360...")
+            lidar = LivoxReceiver(
+                config_path="mid360_config.json",
+                host_ip="192.168.123.165"
+            )
+            print("Livox iniciado.")
+
 
         output_dir = "outputs"
         os.makedirs(output_dir, exist_ok=True)
@@ -213,37 +231,52 @@ class RobotController:
                 yaw = self.current_state.imu_state.rpy[2]
 
             # ---------------------------------------------------
-            # 1. Tentar ler dados do MuJoCo
+            # Sensores
             # ---------------------------------------------------
-            mujoco_ok, mx, my, myaw, rays = sensor_mujoco_json()
 
-            if mujoco_ok:
-                self.pos_x = mx
-                self.pos_y = my
-                yaw = myaw
-                slam.update_from_mujoco_rays(rays)
+            if not real_robot:
+                # ---------------------------------------------------
+                # Simulação: ler dados do MuJoCo
+                # ---------------------------------------------------
+                mujoco_ok, mx, my, myaw, rays = sensor_mujoco_json()
+
+                if mujoco_ok:
+                    self.pos_x = mx
+                    self.pos_y = my
+                    yaw = myaw
+                    slam.update_from_mujoco_rays(rays)
 
             else:
                 # ---------------------------------------------------
-                # 2. Robô real: tentar usar LiDAR real
+                # Robô real: ler point cloud do Livox
                 # ---------------------------------------------------
                 curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
 
-                obs, free = sensor_real(
-                    self.current_state,
-                    curr_cell_x,
-                    curr_cell_y,
-                    yaw,
-                    map_size=slam.map_size,
-                    resolution=MAP_RESOLUTION,
-                    max_range_meters=5.0
-                )
+                xyz = None
 
-                for pt in obs:
-                    slam._update_cell(pt[0], pt[1], True)
+                if lidar is not None:
+                    xyz = lidar.get_latest_points()
 
-                for pt in free:
-                    slam._update_cell(pt[0], pt[1], False)
+                if xyz is not None:
+                    obs, free = pointcloud_to_occupancy_points(
+                        xyz,
+                        curr_cell_x,
+                        curr_cell_y,
+                        yaw,
+                        map_size=slam.map_size,
+                        resolution=MAP_RESOLUTION,
+                        max_range_meters=5.0,
+                        min_z=-0.30,
+                        max_z=1.50,
+                        min_dist_m=0.20,
+                        point_step=5
+                    )
+
+                    for pt in free:
+                        slam._update_cell(pt[0], pt[1], False)
+
+                    for pt in obs:
+                        slam._update_cell(pt[0], pt[1], True)
 
             curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
             slam.update_pose(curr_cell_x, curr_cell_y, yaw)
@@ -362,3 +395,4 @@ class RobotController:
 
 if __name__ == '__main__':
     RobotController().run()
+
