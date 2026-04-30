@@ -62,13 +62,12 @@ def sensor_real(
 
     obstacle_points = []
     free_points = []
-    
-    print("DEBUG sensor_real chamado")
-    print("state is None?", state is None)
-    
-    if state is not None:
-        print("state tem lidar?", hasattr(state, "lidar"))
-        print("campos do state:", dir(state))
+
+    if state is None:
+        return obstacle_points, free_points
+
+    if not hasattr(state, "lidar"):
+        return obstacle_points, free_points
 
     lidar = state.lidar
 
@@ -158,3 +157,117 @@ def sensor_sim(
             obstacle_points.append((ox, oy))
 
     return obstacle_points, free_points
+
+
+# ---------------------------------------------------------------
+# POINT CLOUD LIVOX -> OCCUPANCY GRID
+# ---------------------------------------------------------------
+
+def bresenham_cells(x0, y0, x1, y1):
+    """
+    Devolve células entre dois pontos usando Bresenham.
+    Usado para marcar espaço livre entre o robô e o obstáculo.
+    """
+
+    cells = []
+
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+
+    err = dx - dy
+
+    while True:
+        cells.append((x0, y0))
+
+        if x0 == x1 and y0 == y1:
+            break
+
+        e2 = 2 * err
+
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+
+        if e2 < dx:
+            err += dx
+            y0 += sy
+
+    return cells
+
+
+def pointcloud_to_occupancy_points(
+    xyz,
+    robot_x,
+    robot_y,
+    robot_yaw,
+    map_size=200,
+    resolution=0.05,
+    max_range_meters=5.0,
+    min_z=-0.30,
+    max_z=1.50,
+    min_dist_m=0.20,
+    point_step=5
+):
+    """
+    Converte point cloud Livox Nx3 em pontos ocupados e livres.
+
+    xyz:
+        matriz Nx3 com pontos no referencial do LiDAR/robô
+
+    robot_x, robot_y:
+        posição do robô em células
+
+    robot_yaw:
+        orientação do robô em radianos
+
+    Devolve:
+        obstacle_points, free_points
+    """
+
+    obstacle_points = set()
+    free_points = set()
+
+    if xyz is None or len(xyz) == 0:
+        return [], []
+
+    cos_yaw = math.cos(robot_yaw)
+    sin_yaw = math.sin(robot_yaw)
+
+    # Processa só alguns pontos para não ficar demasiado pesado
+    for p in xyz[::point_step]:
+        x_lidar = float(p[0])
+        y_lidar = float(p[1])
+        z_lidar = float(p[2])
+
+        # Filtrar chão/teto/pontos demasiado altos ou baixos
+        if z_lidar < min_z or z_lidar > max_z:
+            continue
+
+        dist = math.sqrt(x_lidar * x_lidar + y_lidar * y_lidar)
+
+        if dist < min_dist_m or dist > max_range_meters:
+            continue
+
+        # Transformar do referencial do LiDAR/robô para o referencial do mapa
+        x_map_rel = cos_yaw * x_lidar - sin_yaw * y_lidar
+        y_map_rel = sin_yaw * x_lidar + cos_yaw * y_lidar
+
+        ox = int(robot_x + x_map_rel / resolution)
+        oy = int(robot_y + y_map_rel / resolution)
+
+        if not (0 <= ox < map_size and 0 <= oy < map_size):
+            continue
+
+        obstacle_points.add((ox, oy))
+
+        # Marcar espaço livre desde o robô até ao obstáculo
+        ray_cells = bresenham_cells(robot_x, robot_y, ox, oy)
+
+        for cx, cy in ray_cells[:-1]:
+            if 0 <= cx < map_size and 0 <= cy < map_size:
+                free_points.add((cx, cy))
+
+    return list(obstacle_points), list(free_points)
