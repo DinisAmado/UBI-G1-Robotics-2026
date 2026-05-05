@@ -163,7 +163,7 @@ class RobotController:
             print("A iniciar Livox MID-360...")
             lidar = LivoxReceiver(
                 config_path="mid360_config.json",
-                host_ip="192.168.123.165"
+                host_ip="192.168.123.51"
             )
             print("Livox iniciado.")
 
@@ -395,4 +395,3 @@ class RobotController:
 
 if __name__ == '__main__':
     RobotController().run()
-
