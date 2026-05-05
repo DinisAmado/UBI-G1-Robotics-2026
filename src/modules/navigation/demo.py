@@ -205,15 +205,12 @@ class RobotController:
 
         robot_dot, = ax.plot([], [], "ro", markersize=8, label="Robô G1")
         robot_arrow = ax.quiver(
-            [],
-            [],
-            [],
-            [],
-            angles="xy",
-            scale_units="xy",
+            [0], [0], [0], [0],
+            angles='xy',
+            scale_units='xy',
             scale=1,
-            color="red",
-            width=0.006
+            color='red',
+            width=0.004
         )
         path_line, = ax.plot([], [], "g-", linewidth=2, label="Caminho A*")
         goal_dot, = ax.plot([], [], "bo", markersize=6, label="Objetivo")
@@ -276,7 +273,7 @@ class RobotController:
                         yaw,
                         map_size=slam.map_size,
                         resolution=MAP_RESOLUTION,
-                        max_range_meters=5.0,
+                        max_range_meters=4.0,
                         min_z=-0.30,
                         max_z=1.50,
                         min_dist_m=0.20,
@@ -336,14 +333,15 @@ class RobotController:
                     path_line.set_data([], [])
 
                 robot_dot.set_data([curr_cell_y], [curr_cell_x])
-                arrow_len = 12  # tamanho da seta em células
-                # No gráfico, o eixo horizontal é cell_y
-                # e o eixo vertical é cell_x.
-                arrow_dx_plot = arrow_len * math.sin(yaw)
-                arrow_dy_plot = arrow_len * math.cos(yaw)
 
-                robot_arrow.set_offsets([[curr_cell_y, curr_cell_x]])
-                robot_arrow.set_UVC([arrow_dx_plot], [arrow_dy_plot])
+                arrow_len = 10  # comprimento da seta em células
+                # eixo horizontal = cell_y
+                # eixo vertical   = cell_x
+                arrow_dx = arrow_len * math.sin(yaw)
+                arrow_dy = arrow_len * math.cos(yaw)
+
+                robot_arrow.set_offsets(np.array([[curr_cell_y, curr_cell_x]]))
+                robot_arrow.set_UVC(np.array([arrow_dx]), np.array([arrow_dy]))
 
                 if current_goal_cell is not None:
                     goal_dot.set_data([current_goal_cell[1]], [current_goal_cell[0]])
