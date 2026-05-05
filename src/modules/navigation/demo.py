@@ -33,6 +33,7 @@ from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
 
 from slam_navigation import SLAMNavigation
 from sensores import sensor_mujoco_json, pointcloud_to_occupancy_points
@@ -57,6 +58,15 @@ def cell_to_world(cell_x, cell_y):
     world_x = MAP_ORIGIN_X + cell_x * MAP_RESOLUTION
     world_y = MAP_ORIGIN_Y + cell_y * MAP_RESOLUTION
     return world_x, world_y
+
+
+def yaw_from_quaternion(qx, qy, qz, qw):
+    """
+    Converte quaternion em yaw.
+    """
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 def find_approach_goal(
@@ -108,6 +118,7 @@ def find_approach_goal(
 class RobotController:
     def __init__(self):
         self.current_state = None
+        self.current_odom = None
         self.crc = CRC()
 
         self.pos_x = 0.0
@@ -115,6 +126,9 @@ class RobotController:
 
     def LowStateHandler(self, msg: LowState_):
         self.current_state = msg
+
+    def OdomHandler(self, msg: Odometry_):
+        self.current_odom = msg
 
     def run(self):
         plt.close('all')
@@ -131,6 +145,9 @@ class RobotController:
 
         low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
         low_state_sub.Init(self.LowStateHandler, 10)
+
+        odom_sub = ChannelSubscriber("rt/unitree/slam_mapping/odom", Odometry_)
+        odom_sub.Init(self.OdomHandler, 10)
 
         low_cmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
         low_cmd_pub.Init()
@@ -235,8 +252,31 @@ class RobotController:
 
             yaw = 0.0
 
-            if self.current_state and hasattr(self.current_state, 'imu_state'):
-                yaw = self.current_state.imu_state.rpy[2]
+            # Preferir odometria real do módulo SLAM da Unitree
+            if self.current_odom is not None:
+                try:
+                    pose = self.current_odom.pose.pose
+
+                    self.pos_x = float(pose.position.x)
+                    self.pos_y = float(pose.position.y)
+
+                    qx = float(pose.orientation.x)
+                    qy = float(pose.orientation.y)
+                    qz = float(pose.orientation.z)
+                    qw = float(pose.orientation.w)
+
+                    yaw = yaw_from_quaternion(qx, qy, qz, qw)
+
+                except Exception as e:
+                    print("Erro ao ler odometria:", e)
+
+                    if self.current_state and hasattr(self.current_state, 'imu_state'):
+                        yaw = self.current_state.imu_state.rpy[2]
+
+            else:
+                # Fallback: usar IMU caso ainda não haja odometria
+                if self.current_state and hasattr(self.current_state, 'imu_state'):
+                    yaw = self.current_state.imu_state.rpy[2]
 
             # ---------------------------------------------------
             # Sensores
