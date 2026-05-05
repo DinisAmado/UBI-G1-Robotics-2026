@@ -223,6 +223,15 @@ class SLAMNavigation:
 
         return True
 
+    def decay_map(self, decay_factor=0.97):
+        """
+        Faz o mapa esquecer gradualmente observações antigas.
+
+        Isto ajuda a remover rastos quando o robô roda e a point cloud
+        ainda está a ser usada como mapa local.
+        """
+        self.log_odds_grid *= decay_factor
+
 
     # ------------------------------------------------------------------
     # Utilitários
