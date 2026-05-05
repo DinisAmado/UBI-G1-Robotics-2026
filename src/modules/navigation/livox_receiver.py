@@ -34,7 +34,7 @@ class LivoxReceiver(_Livox):
         xyz[:, 2] = z
     """
 
-    def __init__(self, config_path="mid360_config.json", host_ip="192.168.123.165"):
+    def __init__(self, config_path="mid360_config.json", host_ip="192.168.123.51"):
         if _SDK2:
             super().__init__(config_path, host_ip=host_ip)
         else:
