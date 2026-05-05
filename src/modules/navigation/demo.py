@@ -247,6 +247,8 @@ class RobotController:
         last_saved_path = None
         MAP_SAVE_INTERVAL = 2.0
 
+        debug_counter = 0
+
         while True:
             step_start = time.perf_counter()
 
@@ -299,6 +301,12 @@ class RobotController:
                 # Robô real: ler point cloud do Livox
                 # ---------------------------------------------------
                 curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
+
+                debug_counter += 1
+
+                if debug_counter >= 100:
+                    debug_counter = 0
+                    print(f"ODOM pos=({self.pos_x:.2f}, {self.pos_y:.2f}) yaw={yaw:.2f}")
 
                 xyz = None
 
