@@ -209,7 +209,8 @@ def pointcloud_to_occupancy_points(
     min_z=-0.30,
     max_z=1.50,
     min_dist_m=0.20,
-    point_step=5
+    point_step=5,
+    apply_yaw=True
 ):
     """
     Converte point cloud Livox Nx3 em pontos ocupados e livres.
@@ -252,8 +253,12 @@ def pointcloud_to_occupancy_points(
             continue
 
         # Transformar do referencial do LiDAR/robô para o referencial do mapa
-        x_map_rel = cos_yaw * x_lidar - sin_yaw * y_lidar
-        y_map_rel = sin_yaw * x_lidar + cos_yaw * y_lidar
+        if apply_yaw:
+            x_map_rel = cos_yaw * x_lidar - sin_yaw * y_lidar
+            y_map_rel = sin_yaw * x_lidar + cos_yaw * y_lidar
+        else:
+            x_map_rel = x_lidar
+            y_map_rel = y_lidar
 
         ox = int(robot_x + x_map_rel / resolution)
         oy = int(robot_y + y_map_rel / resolution)
