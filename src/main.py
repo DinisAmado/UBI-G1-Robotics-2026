@@ -12,7 +12,7 @@ from cyclonedds.sub import Subscriber, DataReader
 from qos_profiles import (
     QOS_HMI, QOS_ORCHESTRATION, QOS_HEARTBEAT,
     QOS_VISION, QOS_SLAM_MAP,
-    QOS_NAV, QOS_GRASP, QOS_MOTION,
+    QOS_NAV, QOS_GRASP,
 )
 
 from idl_ri import (
@@ -20,9 +20,9 @@ from idl_ri import (
     Intent, Acao, Feedback, OrchestrationState as HmiState,
     OrchestratorState, ActiveModules, Phase, Heartbeat,
     NavGoal as Goal, GoalType, GoalData, NavStatusMsg as NavStatus,
-    GraspCommand, GraspStatusMsg as GraspStatus,
-    MotionCommand, Posture, MotionStatusMsg as MotionStatus,
-    Objects as VisionObjects, Persons as VisionPersons, Locations
+    GraspCommand, GraspStatusMsg as GraspStatus, Posture,
+    Objects as VisionObjects, Persons as VisionPersons,
+    Locations,
 )
 
 
@@ -42,12 +42,10 @@ MAX_RETRIES      = 3      # tentativas por fase antes de ABORTED
 LOOP_HZ          = 20     # frequência do loop principal
 VISION_MIN_CONF  = 0.6    # confiança mínima para aceitar uma detecção de objecto
 
-# ── Timeouts por fase ────────────────────────────────────────────
-#
-# Se uma fase ultrapassar este tempo (segundos) sem avançar, é tratada como falha e entra no ciclo de retry normal.
-# Fases sem entrada aqui (IDLE, WAITING_FOR_INTENT, etc.) não têm timeout.
-
-PHASE_TIMEOUTS: dict[Phase, float] = {                   
+# Timeouts por fase (segundos).
+# Se uma fase ultrapassar este tempo sem avançar, entra no ciclo de retry.
+# Fases sem entrada (IDLE, WAITING_FOR_INTENT, etc.) não têm timeout.
+PHASE_TIMEOUTS: dict[Phase, float] = {
     Phase.LOCATING_OBJECT:      10.0,
     Phase.NAVIGATING_TO_TABLE:  20.0,
     Phase.GRASPING_OBJECT:      15.0,
@@ -55,16 +53,18 @@ PHASE_TIMEOUTS: dict[Phase, float] = {
     Phase.DELIVERING:           10.0,
 }
 
-TABLE_LOCATION_NAME = "table"   # nome da localização SLAM usada para navegar até à mesa
-LIP_MOVEMENT_MIN_CONF = 0.5     # confiança mínima para aceitar deteção de pessoa por lábios
+TABLE_LOCATION_NAME   = "table"   # nome da localização SLAM para a mesa
+LIP_MOVEMENT_MIN_CONF = 0.5       # confiança mínima para deteção de pessoa por lábios
 
 
 # ─── Mapeamento Fase → Módulos Activos ───────────────────────────────────────
 #
 # Quando o orquestrador entra numa fase, publica rt/orchestration/state
-# com este ActiveModules. Cada módulo subscreve esse tópico e verifica
-# o seu próprio campo — se for False, o módulo ignora dados de entrada
-# e não processa nada.
+# com este ActiveModules. Cada módulo verifica o seu próprio campo —
+# se for False, ignora dados de entrada e não processa nada.
+#
+# Nota: o campo 'motion' refere-se ao módulo de locomoção (cmd_vel).
+# O braço é sempre controlado pelo módulo de grasping.
 
 PHASE_MODULES: dict[Phase, ActiveModules] = {
     Phase.IDLE: ActiveModules(
@@ -81,19 +81,19 @@ PHASE_MODULES: dict[Phase, ActiveModules] = {
     ),
     Phase.NAVIGATING_TO_TABLE: ActiveModules(
         vision_objects=True,  vision_persons=False,
-        navigation=True,  grasping=False, motion=False,
+        navigation=True,  grasping=False, motion=True,
     ),
     Phase.GRASPING_OBJECT: ActiveModules(
         vision_objects=False, vision_persons=True,
-        navigation=False, grasping=True,  motion=True,
+        navigation=False, grasping=True,  motion=False,
     ),
     Phase.NAVIGATING_TO_PERSON: ActiveModules(
         vision_objects=False, vision_persons=True,
-        navigation=True,  grasping=False, motion=False,
+        navigation=True,  grasping=False, motion=True,
     ),
     Phase.DELIVERING: ActiveModules(
         vision_objects=False, vision_persons=True,
-        navigation=False, grasping=False, motion=True,
+        navigation=False, grasping=True,  motion=False,
     ),
     Phase.RECOVERING: ActiveModules(
         vision_objects=False, vision_persons=False,
@@ -111,17 +111,17 @@ PHASE_MODULES: dict[Phase, ActiveModules] = {
 @dataclass
 class OrchestratorContext:
     # Intent actual recebido do HMI
-    current_intent:   Optional[Intent]      = None
+    current_intent:    Optional[Intent] = None
 
     # Último objecto detectado pela visão (imagem usada pelo grasping)
-    last_object_image: Optional[Image]      = None   # vision.ObjectDetection.image
-    last_object_name:  str                  = ""
+    last_object_image: Optional[Image]  = None
+    last_object_name:  str              = ""
 
     # Última pessoa detetada por movimento dos lábios
-    last_person_id:   str                   = ""
+    last_person_id:    str              = ""
 
     # Localizações conhecidas do SLAM (actualizadas em background)
-    known_locations:  Optional[Locations]   = None
+    known_locations:   Optional[Locations] = None
 
     # Contadores de retry por fase (reset ao completar tarefa com sucesso)
     retry_counts: dict = field(default_factory=lambda: {p: 0 for p in Phase})
@@ -137,9 +137,9 @@ class Orchestrator:
         self._lock  = threading.Lock()
         self._seq   = 0
 
-        self._phase_start_time: float       = time.time()
-        self._recover_until:    Optional[float] = None   # timer não-bloqueante
-        self._abort_until:      Optional[float] = None   # timer não-bloqueante
+        self._phase_start_time: float        = time.time()
+        self._recover_until:    Optional[float] = None
+        self._abort_until:      Optional[float] = None
 
         # ── DDS setup ──────────────────────────────────────────────────────
         self._dp = DomainParticipant(DOMAIN_ID)
@@ -147,51 +147,46 @@ class Orchestrator:
         sub      = Subscriber(self._dp)
 
         # ── Topics ─────────────────────────────────────────────────────────
-        t_orch_state    = Topic(self._dp, "rt/orchestration/state",      OrchestratorState, qos=QOS_ORCHESTRATION)
-        t_orch_hb       = Topic(self._dp, "rt/orchestration/heartbeat",  Heartbeat,         qos=QOS_HEARTBEAT)
-        t_hmi_intent    = Topic(self._dp, "rt/hmi/intent",               Intent,            qos=QOS_HMI)
-        t_hmi_feedback  = Topic(self._dp, "rt/hmi/feedback",             Feedback,          qos=QOS_HMI)
-        t_nav_goal      = Topic(self._dp, "rt/nav/goal",                 Goal,              qos=QOS_NAV)
-        t_nav_status    = Topic(self._dp, "rt/nav/status",               NavStatus,         qos=QOS_NAV)
-        t_grasp_cmd     = Topic(self._dp, "rt/grasp/command",            GraspCommand,      qos=QOS_GRASP)
-        t_grasp_status  = Topic(self._dp, "rt/grasp/status",             GraspStatus,       qos=QOS_GRASP)
-        t_motion_cmd    = Topic(self._dp, "rt/motion/command",           MotionCommand,     qos=QOS_MOTION)
-        t_motion_status = Topic(self._dp, "rt/motion/status",            MotionStatus,      qos=QOS_MOTION)
-        t_vision_obj    = Topic(self._dp, "rt/vision/objects",           VisionObjects,     qos=QOS_VISION)
-        t_vision_per    = Topic(self._dp, "rt/vision/persons",           VisionPersons,     qos=QOS_VISION)
-        t_slam_locs     = Topic(self._dp, "rt/slam/locations",           Locations,         qos=QOS_SLAM_MAP)
+        t_orch_state   = Topic(self._dp, "rt/orchestration/state",     OrchestratorState, qos=QOS_ORCHESTRATION)
+        t_orch_hb      = Topic(self._dp, "rt/orchestration/heartbeat", Heartbeat,         qos=QOS_HEARTBEAT)
+        t_hmi_intent   = Topic(self._dp, "rt/hmi/intent",              Intent,            qos=QOS_HMI)
+        t_hmi_feedback = Topic(self._dp, "rt/hmi/feedback",            Feedback,          qos=QOS_HMI)
+        t_nav_goal     = Topic(self._dp, "rt/nav/goal",                Goal,              qos=QOS_NAV)
+        t_nav_status   = Topic(self._dp, "rt/nav/status",              NavStatus,         qos=QOS_NAV)
+        t_grasp_cmd    = Topic(self._dp, "rt/grasp/command",           GraspCommand,      qos=QOS_GRASP)
+        t_grasp_status = Topic(self._dp, "rt/grasp/status",            GraspStatus,       qos=QOS_GRASP)
+        t_vision_obj   = Topic(self._dp, "rt/vision/objects",          VisionObjects,     qos=QOS_VISION)
+        t_vision_per   = Topic(self._dp, "rt/vision/persons",          VisionPersons,     qos=QOS_VISION)
+        t_slam_locs    = Topic(self._dp, "rt/slam/locations",          Locations,         qos=QOS_SLAM_MAP)
 
-        # ── Writers (o orquestrador publica estes tópicos) ─────────────────
+        # ── Writers ────────────────────────────────────────────────────────
         self._w_orch_state   = DataWriter(pub, t_orch_state)
         self._w_orch_hb      = DataWriter(pub, t_orch_hb)
         self._w_hmi_feedback = DataWriter(pub, t_hmi_feedback)
         self._w_nav_goal     = DataWriter(pub, t_nav_goal)
         self._w_grasp_cmd    = DataWriter(pub, t_grasp_cmd)
-        self._w_motion_cmd   = DataWriter(pub, t_motion_cmd)
 
-        # ── Readers (o orquestrador subscreve estes tópicos) ───────────────
-        self._r_hmi_intent    = DataReader(sub, t_hmi_intent)
-        self._r_nav_status    = DataReader(sub, t_nav_status)
-        self._r_grasp_status  = DataReader(sub, t_grasp_status)
-        self._r_motion_status = DataReader(sub, t_motion_status)
-        self._r_vision_obj    = DataReader(sub, t_vision_obj)
-        self._r_vision_per    = DataReader(sub, t_vision_per)
-        self._r_slam_locs     = DataReader(sub, t_slam_locs)
+        # ── Readers ────────────────────────────────────────────────────────
+        self._r_hmi_intent   = DataReader(sub, t_hmi_intent)
+        self._r_nav_status   = DataReader(sub, t_nav_status)
+        self._r_grasp_status = DataReader(sub, t_grasp_status)
+        self._r_vision_obj   = DataReader(sub, t_vision_obj)
+        self._r_vision_per   = DataReader(sub, t_vision_per)
+        self._r_slam_locs    = DataReader(sub, t_slam_locs)
 
         log.info("Orquestrador inicializado no domínio %d", DOMAIN_ID)
 
-    # Máquina de estados
+    # ── Máquina de estados ────────────────────────────────────────────────────
 
     def _transition(self, new_phase: Phase, reason: str = "") -> None:
 
         with self._lock:
-            old_phase          = self._phase
-            self._phase        = new_phase
-            self._phase_start_time = time.time()    
+            old_phase              = self._phase
+            self._phase            = new_phase
+            self._phase_start_time = time.time()
 
         log.info("%-25s → %-25s  (%s)", old_phase.name, new_phase.name, reason)
 
-        # Publica o novo estado
         self._w_orch_state.write(OrchestratorState(
             header=self._make_header(),
             phase=new_phase,
@@ -201,13 +196,10 @@ class Orchestrator:
             reason=reason,
         ))
 
-        # Mantém o HMI informado (interface do operador)
         self._publish_hmi_feedback(new_phase, reason)
 
-    # ── Verificação de timeout ───────────────────────────────────
-
     def _check_timeout(self) -> None:
-       
+
         timeout = PHASE_TIMEOUTS.get(self._phase)
         if timeout is None:
             return
@@ -220,7 +212,6 @@ class Orchestrator:
 
     def _step(self) -> None:
 
-        # Verificar timeout antes de processar a fase
         self._check_timeout()
 
         phase = self._phase
@@ -241,13 +232,10 @@ class Orchestrator:
             self._handle_grasp_status()
 
         elif phase == Phase.NAVIGATING_TO_PERSON:
-            self._handle_nav_status(
-                on_done=Phase.DELIVERING,
-                on_done_reason="chegou à pessoa",
-            )
+            self._handle_nav_to_person()
 
         elif phase == Phase.DELIVERING:
-            self._handle_motion_status()
+            self._handle_delivering()
 
         elif phase == Phase.RECOVERING:
             self._handle_recovering()
@@ -255,7 +243,7 @@ class Orchestrator:
         elif phase == Phase.ABORTED:
             self._handle_aborted()
 
-    # Handlers por fase
+    # ── Handlers por fase ─────────────────────────────────────────────────────
 
     def _handle_waiting_for_intent(self) -> None:
 
@@ -269,22 +257,22 @@ class Orchestrator:
 
         if sample.acao in (Acao.ENTREGAR, Acao.RECOLHER):
             self._ctx.last_object_name  = sample.alvo
-            self._ctx.last_object_image = None   # será preenchido pela visão
+            self._ctx.last_object_image = None
             self._transition(Phase.LOCATING_OBJECT,
                              f"à procura de '{sample.alvo}'")
 
         elif sample.acao == Acao.LARGA:
-            # Ordenar directamente ao grasping para largar o objeto
+            # Largar objeto imediatamente — braço neutro + drop
             self._w_grasp_cmd.write(GraspCommand(
                 header=self._make_header(),
                 objeto=sample.alvo,
-                objeto_id="",
+                objeto_id="drop",
                 image=Image(),
+                postura=Posture.NEUTRAL,
             ))
             self._transition(Phase.DELIVERING, "a largar objeto")
 
         elif sample.acao == Acao.SEGUIR:
-            # Pessoa identificada dinamicamente pela visão (movimento dos lábios)
             self._transition(Phase.NAVIGATING_TO_PERSON, "a seguir pessoa")
 
         elif sample.acao == Acao.PARAR:
@@ -303,7 +291,6 @@ class Orchestrator:
                 self._ctx.last_object_image = det.image
                 log.info("Objecto '%s' localizado (conf=%.2f)", det.name, det.confidence)
 
-                # Navega para a localização da mesa via SLAM (pose removida da visão)
                 self._w_nav_goal.write(Goal(
                     header=self._make_header(),
                     data=GoalData(discriminator=GoalType.NAMED,
@@ -320,87 +307,100 @@ class Orchestrator:
             return
 
         if sample.status == Status.DONE:
+            # Chegou à mesa — pede ao grasping para estender o braço e agarrar
             image = self._ctx.last_object_image or Image()
             self._w_grasp_cmd.write(GraspCommand(
                 header=self._make_header(),
                 objeto=self._ctx.last_object_name,
                 objeto_id="",
                 image=image,
+                postura=Posture.EXTEND_ARM_FORWARD,
             ))
-            log.info("GraspCommand enviado para '%s'", self._ctx.last_object_name)
+            log.info("GraspCommand enviado para '%s' (braço estendido)",
+                     self._ctx.last_object_name)
             self._transition(Phase.GRASPING_OBJECT, "chegou à mesa")
 
         elif sample.status == Status.FAILED:
             self._handle_retry(self._phase, sample.reason)
 
-    def _handle_nav_status(self, on_done: Phase, on_done_reason: str) -> None:
-
-        sample = self._read_one(self._r_nav_status)
-        if sample is None:
-            return
-
-        if sample.status == Status.DONE:
-            self._transition(on_done, on_done_reason)
-
-        elif sample.status == Status.FAILED:
-            self._handle_retry(self._phase, sample.reason)
-
     def _handle_grasp_status(self) -> None:
+        """Usado nas fases GRASPING_OBJECT e DELIVERING — ambas lêem rt/grasp/status."""
 
         sample = self._read_one(self._r_grasp_status)
         if sample is None:
             return
 
         if sample.status == Status.DONE:
-            # Braço em postura de transporte
-            self._w_motion_cmd.write(MotionCommand(
-                header=self._make_header(),
-                postura=Posture.NEUTRAL,
-            ))
 
-            # Navega até à pessoa (identificada via movimento dos lábios)
-            goal = self._build_person_goal()
-            if goal:
-                self._w_nav_goal.write(goal)
-                self._transition(Phase.NAVIGATING_TO_PERSON,
-                                 f"a navegar para '{self._ctx.last_person_id}'"
-                                 if self._ctx.last_person_id else "a navegar para pessoa")
-            else:
-                log.error("Não foi possível localizar a pessoa nas localizações SLAM.")
-                self._handle_retry(Phase.NAVIGATING_TO_PERSON, "pessoa não encontrada no SLAM")
+            if self._phase == Phase.GRASPING_OBJECT:
+                # Objeto agarrado — braço em postura de transporte
+                self._w_grasp_cmd.write(GraspCommand(
+                    header=self._make_header(),
+                    objeto=self._ctx.last_object_name,
+                    objeto_id="carry",
+                    image=Image(),
+                    postura=Posture.NEUTRAL,
+                ))
+
+                # Navega até à pessoa identificada pelos lábios
+                goal = self._build_person_goal()
+                if goal:
+                    self._w_nav_goal.write(goal)
+                    self._transition(Phase.NAVIGATING_TO_PERSON,
+                                     f"a navegar para '{self._ctx.last_person_id}'"
+                                     if self._ctx.last_person_id else "a navegar para pessoa")
+                else:
+                    log.error("Não foi possível localizar a pessoa nas localizações SLAM.")
+                    self._handle_retry(Phase.NAVIGATING_TO_PERSON,
+                                       "pessoa não encontrada no SLAM")
+
+            elif self._phase == Phase.DELIVERING:
+                # Entrega concluída
+                log.info("Entrega concluída com sucesso!")
+                self._ctx.retry_counts = {p: 0 for p in Phase}
+                self._transition(Phase.IDLE, "tarefa concluída")
 
         elif sample.status == Status.FAILED:
-            self._handle_retry(Phase.GRASPING_OBJECT, sample.reason)
+            self._handle_retry(self._phase, sample.reason)
 
-    def _handle_motion_status(self) -> None:
+    def _handle_nav_to_person(self) -> None:
 
-        sample = self._read_one(self._r_motion_status)
+        sample = self._read_one(self._r_nav_status)
         if sample is None:
             return
 
         if sample.status == Status.DONE:
-            log.info("Entrega concluída com sucesso!")
-            # Reset dos contadores de retry para a próxima tarefa
-            self._ctx.retry_counts = {p: 0 for p in Phase}
-            self._transition(Phase.IDLE, "tarefa concluída")
+            # Chegou à pessoa — pede ao grasping para estender o braço e entregar
+            self._w_grasp_cmd.write(GraspCommand(
+                header=self._make_header(),
+                objeto=self._ctx.last_object_name,
+                objeto_id="deliver",
+                image=Image(),
+                postura=Posture.EXTEND_ARM_FORWARD,
+            ))
+            log.info("A entregar '%s' à pessoa '%s'",
+                     self._ctx.last_object_name, self._ctx.last_person_id)
+            self._transition(Phase.DELIVERING, "chegou à pessoa")
 
         elif sample.status == Status.FAILED:
-            self._handle_retry(Phase.DELIVERING, sample.reason)
+            self._handle_retry(self._phase, sample.reason)
+
+    def _handle_delivering(self) -> None:
+        """DELIVERING aguarda confirmação do grasping — reutiliza _handle_grasp_status."""
+        self._handle_grasp_status()
 
     def _handle_recovering(self) -> None:
+
         if self._recover_until is None:
-            # Largar objeto se o robô o tiver (last_object_image é None antes do locating)
+            # Se o robô tiver o objeto na mão, largar antes de recuperar
             if self._ctx.last_object_image is not None:
                 log.warning("A largar objeto antes de recuperar...")
-                self._w_motion_cmd.write(MotionCommand(
-                    header=self._make_header(),
-                    postura=Posture.NEUTRAL,
-                ))
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto="",
                     objeto_id="drop",
                     image=Image(),
+                    postura=Posture.NEUTRAL,
                 ))
             self._recover_until = time.time() + 3.0
             log.warning("A recuperar de erro — aguarda 3 s...")
@@ -412,7 +412,7 @@ class Orchestrator:
             self._transition(Phase.LOCATING_OBJECT, "a tentar novamente após recuperação")
 
     def _handle_aborted(self) -> None:
-        
+
         if self._abort_until is None:
             self._abort_until = time.time() + 2.0
             log.warning("Tarefa abortada. A aguardar novo intent do operador.")
@@ -422,7 +422,7 @@ class Orchestrator:
             self._abort_until = None
             self._transition(Phase.WAITING_FOR_INTENT, "pronto para nova tarefa")
 
-    # Retry
+    # ── Retry ─────────────────────────────────────────────────────────────────
 
     def _handle_retry(self, failed_phase: Phase, reason: str) -> None:
 
@@ -441,10 +441,9 @@ class Orchestrator:
             self._transition(Phase.ABORTED,
                              f"max retries atingido — {reason}")
 
-    # Utilitários
+    # ── Utilitários ───────────────────────────────────────────────────────────
 
     def _read_one(self, reader) -> Optional[object]:
-
         samples = reader.take(1)
         return samples[0] if samples else None
 
@@ -460,17 +459,18 @@ class Orchestrator:
 
         log.warning("Pessoa '%s' não encontrada nas localizações SLAM.",
                     self._ctx.last_person_id)
-        return None  # aproximação final via motion/vision metrics
+        return None
 
     def _make_header(self) -> Header:
         with self._lock:
-            self._seq += 1 
-            seq = self._seq       
+            self._seq += 1
+            seq = self._seq
         return Header(
             timestamp_ns=time.time_ns(),
             frame_id="orchestrator",
             seq=seq,
         )
+
     def _publish_hmi_feedback(self, phase: Phase, message: str) -> None:
 
         phase_to_hmi = {
@@ -501,7 +501,7 @@ class Orchestrator:
             error_msg="",
         ))
 
-    # Atualizações passivas em background (lidas a cada iteração do loop)
+    # ── Atualizações passivas em background ───────────────────────────────────
 
     def _poll_slam_locations(self) -> None:
         for sample in self._r_slam_locs.take():
@@ -522,7 +522,7 @@ class Orchestrator:
             if best:
                 self._ctx.last_person_id = best.id
 
-    # Loop principal
+    # ── Loop principal ────────────────────────────────────────────────────────
 
     def run(self) -> None:
 
@@ -537,14 +537,10 @@ class Orchestrator:
 
         try:
             while True:
-                # -- Atualizações passivas ----------------------------------
                 self._poll_slam_locations()
                 self._poll_vision_persons()
-
-                # -- Passo da máquina de estados ----------------------------
                 self._step()
 
-                # -- Heartbeat a 1 Hz (1 em cada LOOP_HZ iterações) ---------
                 heartbeat_counter += 1
                 if heartbeat_counter >= LOOP_HZ:
                     self._publish_heartbeat()

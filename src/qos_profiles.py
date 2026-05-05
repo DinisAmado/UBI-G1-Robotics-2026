@@ -6,11 +6,10 @@ def _ms(ms: float) -> int:
     return int(ms * 1_000_000)
 
 
-# GRUPO 1 — Orquestração  (rt/orchestration/*)
-
+# ─── GRUPO 1 — Orquestração  (rt/orchestration/*) ────────────────────────────
+#
 #   Reliable | Transient Local | Keep Last 3 | Deadline 5 s | Liveliness 10 s
-#   Resource limits: max_samples=10, max_instances=3
-
+#
 # Justificação: o estado da orquestração tem de ser fiável e disponível para
 # módulos que entrem na rede mais tarde (Transient Local). Keep Last 3 retém
 # os três estados mais recentes para diagnóstico.
@@ -29,11 +28,11 @@ QOS_ORCHESTRATION = Qos(
 QOS_HEARTBEAT = QOS_ORCHESTRATION
 
 
-# GRUPO 2 — SLAM  (rt/slam/*)
-
-#   Pose  : Reliable | Volatile       | Keep Last 1 | Deadline 1 s  | Liveliness 10 s
-#   Mapa  : Reliable | Transient Local| Keep Last 2 | Deadline 15 s | Liveliness 15 s
-
+# ─── GRUPO 2 — SLAM  (rt/slam/*) ─────────────────────────────────────────────
+#
+#   Pose  : Reliable | Volatile        | Keep Last 1 | Deadline 1 s  | Liveliness 10 s
+#   Mapa  : Reliable | Transient Local | Keep Last 2 | Deadline 15 s | Liveliness 15 s
+#
 # Justificação: a pose do robô é publicada continuamente (não precisa de
 # durabilidade), enquanto o mapa é raro e deve estar disponível para
 # recém-chegados (Transient Local).
@@ -59,11 +58,10 @@ QOS_SLAM_MAP = Qos(
 )
 
 
-# GRUPO 3 — Visão  (rt/vision/*)
-
+# ─── GRUPO 3 — Visão  (rt/vision/*) ──────────────────────────────────────────
+#
 #   Reliable | Volatile | Keep Last 3 | Deadline 5 s | Liveliness 5 s
-#   Resource limits: max_samples=3, max_instances=3
-
+#
 # Justificação: dados de visão são produzidos continuamente; não faz sentido
 # guardar histórico para recém-chegados (Volatile). Keep Last 3 suaviza
 # falhas pontuais de deteção sem acumular memória.
@@ -78,18 +76,16 @@ QOS_VISION = Qos(
                           max_samples_per_instance=3),
 )
 
-# Métricas de visão (yaw/depth para Motion) — mesmo perfil
-QOS_VISION_METRICS = QOS_VISION
 
-
-# GRUPO 4 — Grasping  (rt/grasp/*)
-
+# ─── GRUPO 4 — Grasping  (rt/grasp/*) ────────────────────────────────────────
+#
 #   Reliable | Transient Local | Keep Last 1 | Deadline 10 s | Liveliness 10 s
-#   Resource limits: max_samples=1, max_instances=1
-
+#
 # Justificação: cada comando de grasping é único e não deve ser repetido
 # (Keep Last 1). Transient Local garante que o grasping recebe o comando
 # mesmo que arranque ligeiramente depois do orquestrador.
+# Este perfil é também usado para rt/motion/command (postura do braço),
+# pois partilha os mesmos requisitos de fiabilidade.
 
 QOS_GRASP = Qos(
     Policy.Reliability.Reliable(max_blocking_time=_ms(100)),
@@ -102,11 +98,9 @@ QOS_GRASP = Qos(
 )
 
 
-# GRUPO 2 (SLAM) — Navegação  (rt/nav/*)
-# O grupo de Navegação partilha o Grupo 2 com o SLAM.
+# ─── GRUPO 2 (SLAM) — Navegação  (rt/nav/*) ──────────────────────────────────
 #
 #   Reliable | Transient Local | Keep Last 1 | Deadline 2 s | Liveliness 2 s
-#   Resource limits: max_samples=1, max_instances=1
 
 QOS_NAV = Qos(
     Policy.Reliability.Reliable(max_blocking_time=_ms(100)),
@@ -119,14 +113,17 @@ QOS_NAV = Qos(
 )
 
 
-# GRUPO 6 — Movimentação  (rt/motion/*)
-
+# ─── GRUPO 6 — Movimentação  (rt/motion/*) ───────────────────────────────────
+#
 #   Best Effort | Volatile | Keep Last 1 | Deadline 20 ms | Liveliness 20 ms
-#   Resource limits: max_samples=1, max_instances=1
-
-# Justificação: controlo de movimento em tempo real — a latência é crítica.
+#
+# Justificação: controlo de locomoção em tempo real — a latência é crítica.
 # Best Effort evita retransmissões que causariam atrasos. Deadline de 20 ms
-# alinha com a frequência de controlo do robô.
+# alinha com a frequência de controlo do robô (50 Hz).
+#
+# Usado por:
+#   rt/motion/cmd_vel   — navegação → motion  (Vx/Vy/Wz)
+#   rt/motion/odometry  — motion → SLAM/nav   (feedback encoders)
 
 QOS_MOTION = Qos(
     Policy.Reliability.BestEffort,
@@ -138,11 +135,15 @@ QOS_MOTION = Qos(
                           max_samples_per_instance=1),
 )
 
+# Odometria partilha o perfil do motion — produzida a 50 Hz,
+# consumida pelo SLAM e navegação sem necessidade de histórico.
+QOS_ODOMETRY = QOS_MOTION
 
-# GRUPO 5 - HMI  (rt/hmi/*)  
 
-# Intent e Feedback do operador: Reliable + Transient Local para garantir
-# que o orquestrador não perde comandos mesmo com arranque assíncrono.
+# ─── GRUPO 5 — HMI  (rt/hmi/*) ───────────────────────────────────────────────
+#
+# Reliable + Transient Local para garantir que o orquestrador não perde
+# comandos mesmo com arranque assíncrono.
 
 QOS_HMI = Qos(
     Policy.Reliability.Reliable(max_blocking_time=_ms(100)),
@@ -155,9 +156,9 @@ QOS_HMI = Qos(
 )
 
 
-# Mapeamento tópico → perfil QoS  (referência rápida)
-
-# Pode ser usado para iterar sobre todos os perfis em testes ou diagnóstico.
+# ─── Mapeamento tópico → perfil QoS ──────────────────────────────────────────
+#
+# Referência para testes e diagnóstico. Não é usado em runtime.
 
 TOPIC_QOS_MAP: dict[str, Qos] = {
     # HMI
@@ -169,7 +170,6 @@ TOPIC_QOS_MAP: dict[str, Qos] = {
     # Vision
     "rt/vision/objects":            QOS_VISION,
     "rt/vision/persons":            QOS_VISION,
-    "rt/vision/metrics":            QOS_VISION_METRICS,
     # SLAM
     "rt/slam/locations":            QOS_SLAM_MAP,
     "rt/slam/pose":                 QOS_SLAM_POSE,
@@ -177,10 +177,10 @@ TOPIC_QOS_MAP: dict[str, Qos] = {
     "rt/nav/goal":                  QOS_NAV,
     "rt/nav/status":                QOS_NAV,
     "rt/nav/path":                  QOS_NAV,
-    # Grasping
+    # Grasping — controla também o braço (postura via GraspCommand)
     "rt/grasp/command":             QOS_GRASP,
     "rt/grasp/status":              QOS_GRASP,
-    # Motion
-    "rt/motion/command":            QOS_MOTION,
-    "rt/motion/status":             QOS_MOTION,
+    # Motion — apenas locomoção (sem controlo do braço)
+    "rt/motion/cmd_vel":            QOS_MOTION,    # navegação → motion (velocidades)
+    "rt/motion/odometry":           QOS_ODOMETRY,  # motion → slam/nav (encoders)
 }

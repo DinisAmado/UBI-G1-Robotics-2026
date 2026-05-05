@@ -1,12 +1,11 @@
 from enum import auto
 from dataclasses import dataclass, field
-from typing import Optional
 from cyclonedds.idl import IdlStruct, IdlEnum, IdlUnion
 from cyclonedds.idl.types import sequence, uint8, case
 from cyclonedds.idl.annotations import key
 
 
-# rt.common
+# ─── rt.common ───────────────────────────────────────────────────────────────
 
 class Status(IdlEnum):
     RUNNING = auto()
@@ -46,26 +45,26 @@ class Header(IdlStruct, typename="rt.common.Header"):
 class Image(IdlStruct, typename="rt.common.Image"):
     width:    int             = 0
     height:   int             = 0
-    encoding: str             = ""     # ex: "rgb8", "jpeg"
+    encoding: str             = ""
     data:     sequence[uint8] = field(default_factory=list)
 
 
-# rt.hmi
+# ─── rt.hmi ──────────────────────────────────────────────────────────────────
 
 class Acao(IdlEnum):
     ENTREGAR = auto()
     RECOLHER = auto()
     SEGUIR   = auto()
     PARAR    = auto()
-    LARGA    = auto()   # comando para largar o objeto no grasping
+    LARGA    = auto()
 
 
 @dataclass
 class Intent(IdlStruct, typename="rt.hmi.Intent"):
     header:           Header = field(default_factory=Header)
     acao:             Acao   = Acao.ENTREGAR
-    alvo:             str    = ""   # objeto alvo da missão (a ser agarrado)
-    comando_grasping: str    = ""   # instrução específica para o grasping (ex: "pega", "larga")
+    alvo:             str    = ""
+    comando_grasping: str    = ""
 
 
 class OrchestrationState(IdlEnum):
@@ -88,13 +87,13 @@ class Feedback(IdlStruct, typename="rt.hmi.Feedback"):
     state:   OrchestrationState = OrchestrationState.IDLE
 
 
-# rt.vision
+# ─── rt.vision ───────────────────────────────────────────────────────────────
 
 @dataclass
 class ObjectDetection(IdlStruct, typename="rt.vision.ObjectDetection"):
     name:       str   = ""
     confidence: float = 0.0
-    image:      Image = field(default_factory=Image)   # imagem do objeto enviada ao grasping
+    image:      Image = field(default_factory=Image)
 
 
 @dataclass
@@ -106,31 +105,41 @@ class Objects(IdlStruct, typename="rt.vision.Objects"):
 @dataclass
 class PersonDetection(IdlStruct, typename="rt.vision.PersonDetection"):
     id:                      str   = ""
-    lip_movement_confidence: float = 0.0   # deteção da pessoa alvo por movimento dos lábios
+    lip_movement_confidence: float = 0.0
 
 
 @dataclass
 class Persons(IdlStruct, typename="rt.vision.Persons"):
-    header:     Header                   = field(default_factory=Header)
+    header:     Header                    = field(default_factory=Header)
     detections: sequence[PersonDetection] = field(default_factory=list)
 
 
-@dataclass
-class Metrics(IdlStruct, typename="rt.vision.Metrics"):           #ignorar esta struct, não é necessária para a implementação atual
-    header:    Header = field(default_factory=Header)
-    person_id: str    = ""    # pessoa sendo trackada
-    yaw:       float  = 0.0   # ângulo horizontal para a pessoa
-    depth:     float  = 0.0   # distância à pessoa
+# ─── rt.grasp ────────────────────────────────────────────────────────────────
 
+class Posture(IdlEnum):
+    """Postura do braço comandada pelo orquestrador via GraspCommand.
+    O módulo de grasping é o único responsável pelo controlo do braço.
+    """
+    EXTEND_ARM_FORWARD = auto()   # estender braço para agarrar ou entregar
+    NEUTRAL            = auto()   # braço recolhido para transporte
+    READY_TO_RECEIVE   = auto()   # braço preparado para receber objeto
 
-# rt.grasp
 
 @dataclass
 class GraspCommand(IdlStruct, typename="rt.grasp.Command"):
-    header:    Header = field(default_factory=Header)
-    objeto:    str    = ""
-    objeto_id: str    = ""
-    image:     Image  = field(default_factory=Image)   # imagem do objeto quando perto da mesa
+    """Publicado pelo orquestrador para o módulo de grasping.
+
+    Fluxo de uso:
+      1. Chegada à mesa   → postura=EXTEND_ARM_FORWARD, objeto+image preenchidos, objeto_id=""
+      2. Objeto agarrado  → postura=NEUTRAL, objeto_id="carry"  (braço em transporte)
+      3. Chegada à pessoa → postura=EXTEND_ARM_FORWARD, objeto_id="deliver"
+      4. Recovery c/ obj  → postura=NEUTRAL, objeto_id="drop"
+    """
+    header:    Header  = field(default_factory=Header)
+    objeto:    str     = ""
+    objeto_id: str     = ""    # "carry" | "deliver" | "drop" | "" (agarrar)
+    image:     Image   = field(default_factory=Image)
+    postura:   Posture = Posture.NEUTRAL
 
 
 @dataclass
@@ -141,7 +150,7 @@ class GraspStatusMsg(IdlStruct, typename="rt.grasp.StatusMsg"):
     progress: float  = 0.0
 
 
-# rt.slam
+# ─── rt.slam ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class Location(IdlStruct, typename="rt.slam.Location"):
@@ -158,10 +167,10 @@ class Locations(IdlStruct, typename="rt.slam.Locations"):
 @dataclass
 class SlamPoseMsg(IdlStruct, typename="rt.slam.PoseMsg"):
     header: Header = field(default_factory=Header)
-    pose:   Pose   = field(default_factory=Pose)   # pose atual do robô no mapa
+    pose:   Pose   = field(default_factory=Pose)
 
 
-# rt.nav
+# ─── rt.nav ──────────────────────────────────────────────────────────────────
 
 class GoalType(IdlEnum):
     NAMED = auto()
@@ -191,33 +200,35 @@ class NavStatusMsg(IdlStruct, typename="rt.nav.StatusMsg"):
 @dataclass
 class NavPath(IdlStruct, typename="rt.nav.Path"):
     header:    Header         = field(default_factory=Header)
-    waypoints: sequence[Pose] = field(default_factory=list)   # caminho planeado até ao destino
+    waypoints: sequence[Pose] = field(default_factory=list)
 
 
-# rt.motion
+# ─── rt.motion ───────────────────────────────────────────────────────────────
+#
+# O módulo de motion é um seguidor de velocidades puro.
+# Recebe CmdVel da navegação e publica OdometryMsg para o SLAM/navegação.
+# O controlo do braço é responsabilidade exclusiva do módulo de grasping.
 
-class Posture(IdlEnum):
-    EXTEND_ARM_FORWARD = auto()
-    NEUTRAL            = auto()
-    READY_TO_RECEIVE   = auto()
+@dataclass
+class CmdVel(IdlStruct, typename="rt.motion.CmdVel"):
+    """Publicado pela navegação → consumido pelo motion a 50 Hz."""
+    header: Header = field(default_factory=Header)
+    vx:     float  = 0.0   # velocidade linear frente/trás  (m/s)
+    vy:     float  = 0.0   # velocidade lateral esq/dir     (m/s)
+    wz:     float  = 0.0   # velocidade angular yaw          (rad/s)
 
 
 @dataclass
-class MotionCommand(IdlStruct, typename="rt.motion.Command"):
-    header:  Header  = field(default_factory=Header)
-    postura: Posture = Posture.NEUTRAL
+class OdometryMsg(IdlStruct, typename="rt.motion.OdometryMsg"):
+    """Publicado pelo motion → consumido pelo SLAM e navegação."""
+    header: Header = field(default_factory=Header)
+    pose:   Pose   = field(default_factory=Pose)
+    vx:     float  = 0.0
+    vy:     float  = 0.0
+    wz:     float  = 0.0
 
 
-@dataclass
-class MotionStatusMsg(IdlStruct, typename="rt.motion.StatusMsg"):
-    header:   Header = field(default_factory=Header)
-    status:   Status = Status.RUNNING
-    reason:   str    = ""
-    progress: float  = 0.0
-
-
-
-# rt.orchestration
+# ─── rt.orchestration ────────────────────────────────────────────────────────
 
 @dataclass
 class ActiveModules(IdlStruct, typename="rt.orchestration.ActiveModules"):
@@ -251,7 +262,7 @@ class OrchestratorState(IdlStruct, typename="rt.orchestration.State"):
 
 
 @dataclass
-class Heartbeat(IdlStruct, typename="rt.orchestration.Heartbeat"): 
+class Heartbeat(IdlStruct, typename="rt.orchestration.Heartbeat"):
     header:      Header = field(default_factory=Header)
     module_name: str    = ""
     ready:       bool   = False
