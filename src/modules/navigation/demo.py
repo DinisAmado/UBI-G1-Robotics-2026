@@ -163,7 +163,7 @@ class RobotController:
             print("A iniciar Livox MID-360...")
             lidar = LivoxReceiver(
                 config_path="mid360_config.json",
-                host_ip="192.168.123.51"
+                host_ip="192.168.123.165"
             )
             print("Livox iniciado.")
 
@@ -204,6 +204,17 @@ class RobotController:
         leg_obs = mpatches.Patch(color='black', label='Obstáculo')
 
         robot_dot, = ax.plot([], [], "ro", markersize=8, label="Robô G1")
+        robot_arrow = ax.quiver(
+            [],
+            [],
+            [],
+            [],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            color="red",
+            width=0.006
+        )
         path_line, = ax.plot([], [], "g-", linewidth=2, label="Caminho A*")
         goal_dot, = ax.plot([], [], "bo", markersize=6, label="Objetivo")
 
@@ -269,8 +280,12 @@ class RobotController:
                         min_z=-0.30,
                         max_z=1.50,
                         min_dist_m=0.20,
-                        point_step=5
+                        point_step=5,
+                        apply_yaw=True
                     )
+
+                    # Esquece gradualmente leituras antigas para evitar rastos
+                    slam.decay_map(decay_factor=0.97)
 
                     for pt in free:
                         slam._update_cell(pt[0], pt[1], False)
@@ -321,6 +336,14 @@ class RobotController:
                     path_line.set_data([], [])
 
                 robot_dot.set_data([curr_cell_y], [curr_cell_x])
+                arrow_len = 12  # tamanho da seta em células
+                # No gráfico, o eixo horizontal é cell_y
+                # e o eixo vertical é cell_x.
+                arrow_dx_plot = arrow_len * math.sin(yaw)
+                arrow_dy_plot = arrow_len * math.cos(yaw)
+
+                robot_arrow.set_offsets([[curr_cell_y, curr_cell_x]])
+                robot_arrow.set_UVC([arrow_dx_plot], [arrow_dy_plot])
 
                 if current_goal_cell is not None:
                     goal_dot.set_data([current_goal_cell[1]], [current_goal_cell[0]])
@@ -395,3 +418,4 @@ class RobotController:
 
 if __name__ == '__main__':
     RobotController().run()
+
