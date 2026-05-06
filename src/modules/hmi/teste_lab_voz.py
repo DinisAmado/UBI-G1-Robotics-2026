@@ -148,7 +148,8 @@ def gravar() -> Optional[str]:
         if not parts or parts[0] != AUDIO_TOPIC:
             continue
 
-        _, header, pcm_compressed = parts
+        header = parts[1]
+        pcm_compressed = b"".join(parts[2:])
 
         if header and len(header) >= 5:
             last_sr = int.from_bytes(header[:4], "little")
@@ -280,7 +281,7 @@ def main():
         resposta = None
 
         # timeout de pending
-        if pending and (time.time() - pending_time > PENDING_TIMEOUT_SEC):
+        nding and (time.time() - pending_time > PENDING_TIMEOUT_SEC):
             print("[PENDING] expirou")
             pending = None
 
