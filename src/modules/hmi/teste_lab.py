@@ -231,7 +231,7 @@ def gravar() -> Optional[str]:
             is_silence = silence_frames >= 8   # precisa de silêncio consistente
 
             # DEBUG (ativa se quiseres)
-            print(f"RMS={rms:.1f} speech_frames={speech_frames} silence_frames={silence_frames}")
+            #print(f"RMS={rms:.1f} speech_frames={speech_frames} silence_frames={silence_frames}")
 
             if is_speech:
                 if not speech_started:
