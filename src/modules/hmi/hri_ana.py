@@ -14,7 +14,7 @@ from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
 
-WHISPER_MODEL  = "medium"
+WHISPER_MODEL  = "large-v3-turbo"
 OLLAMA_MODEL   = "qwen2.5:1.5b"
 TOPIC_NAME     = "HRICommands"
 AUDIO_TEMP     = "temp_hri.wav"
