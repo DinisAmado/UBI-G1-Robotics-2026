@@ -2,7 +2,6 @@
 
 import os
 import re
-import sys
 import math
 import struct
 import asyncio
@@ -10,6 +9,7 @@ import unicodedata
 import zmq
 import lz4.frame
 import wave
+import time
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
@@ -17,44 +17,36 @@ from typing import Optional
 import pygame
 from faster_whisper import WhisperModel
 import edge_tts
-import ollama as ollama_client
 from cyclonedds.idl import IdlStruct
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
 
-
-# ================= CONFIG =================
+# ==============================================================================
+# CONFIG
+# ==============================================================================
 WHISPER_MODEL = "medium"
-OLLAMA_MODEL = "qwen2.5:1.5b"
 
-TOPIC_NAME = "HRICommands"
 AUDIO_TEMP = "temp_hri.wav"
 AUDIO_RESP = "resposta_hri.mp3"
 
 AUDIO_TOPIC = b"g1_audio"
 G1_IP = "192.168.123.164"
 PORT = 5556
-
 ZMQ_TIMEOUT = 5
 
-# 🔥 AJUSTADO PARA ROBÔ (ruído alto)
 VAD_THRESHOLD = 3500
 VAD_SILENCE_SECS = 1.2
 VAD_MIN_SPEECH_SECS = 0.4
 
+PENDING_TIMEOUT_SEC = 6  # 🔥 IMPORTANTE
 
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
+ACOES_IMEDIATAS = {"ANDAR", "PARAR", "RECUAR"}
 
-ACOES_IMEDIATAS = {
-    "ANDAR", "PARAR", "RECUAR", "LEVANTAR", "SENTAR",
-    "VIRAR_ESQUERDA", "VIRAR_DIREITA", "OLHAR_INTERLOCUTOR",
-    "OLHAR_FRENTE", "CUMPRIMENTAR", "APRESENTAR",
-    "ESTADO_ATUAL", "REPETIR", "LARGAR",
-}
-
-
-# ================= DDS =================
+# ==============================================================================
+# DDS
+# ==============================================================================
 @dataclass
 class HRICommand(IdlStruct):
     source: str
@@ -64,47 +56,43 @@ class HRICommand(IdlStruct):
     confirmed: bool
     timestamp: str
 
-
-# ================= NLP =================
+# ==============================================================================
+# NLP
+# ==============================================================================
 def normalizar(texto: str) -> str:
     return "".join(
         c for c in unicodedata.normalize("NFD", texto.lower())
         if unicodedata.category(c) != "Mn"
     )
 
-
 def contem(texto: str, frase: str) -> bool:
     if " " in frase:
         return frase in texto
     return bool(re.search(r"(?<![a-z])" + re.escape(frase) + r"(?![a-z])", texto))
 
-
-REGRAS = [
-    (["vai buscar", "ir buscar"], "IR_BUSCAR", None),
-    (["traz"], "TRAZER", None),
-    (["agarra"], "AGARRAR", None),
-    (["anda"], "ANDAR", "NENHUM"),
-    (["para"], "PARAR", "NENHUM"),
-    (["recua"], "RECUAR", "NENHUM"),
-    (["levanta"], "LEVANTAR", "NENHUM"),
-    (["senta"], "SENTAR", "NENHUM"),
-    (["ola"], "CUMPRIMENTAR", "NENHUM"),
-
-    # 🔥 IMPORTANTE (tinham perdido isto!)
-    (["sim", "ok", "faz", "quero"], "CONFIRMAR", "NENHUM"),
-    (["nao", "cancela"], "CANCELAR", "NENHUM"),
-]
-
-REGRAS_TARGET = [
-    (["bola", "tenis"], "BOLA_DE_TENIS"),
-    (["cubo", "rubik"], "CUBO_DE_RUBIK"),
-]
-
-
-def classificar(texto: str):
+def classificar(texto: str) -> dict:
     t = normalizar(texto)
     action = "DESCONHECIDA"
     target = "NENHUM"
+
+    REGRAS_TARGET = [
+        (["bola", "tenis"], "BOLA_DE_TENIS"),
+        (["cubo", "rubik"], "CUBO_DE_RUBIK"),
+        (["pasta", "dentes"], "PASTA_DE_DENTES"),
+    ]
+
+    REGRAS = [
+        (["vai buscar", "ir buscar", "apanha"], "IR_BUSCAR", None),
+        (["traz"], "TRAZER", None),
+        (["agarra"], "AGARRAR", None),
+
+        (["anda"], "ANDAR", "NENHUM"),
+        (["para"], "PARAR", "NENHUM"),
+        (["recua"], "RECUAR", "NENHUM"),
+
+        (["sim", "ok", "claro"], "CONFIRMAR", "NENHUM"),
+        (["nao", "cancela"], "CANCELAR", "NENHUM"),
+    ]
 
     for palavras, tgt in REGRAS_TARGET:
         if any(contem(t, p) for p in palavras):
@@ -118,25 +106,18 @@ def classificar(texto: str):
                 target = override
             break
 
-    if action in ACOES_COM_CONFIRMACAO and target == "NENHUM":
-        target = "DESCONHECIDO"
+    return {"action": action, "target": target}
 
-    return action, target
-
-
-# ================= AUDIO =================
-def calcular_rms(pcm):
-    samples = struct.unpack(f"{len(pcm)//2}h", pcm)
+# ==============================================================================
+# AUDIO (VAD)
+# ==============================================================================
+def calcular_rms(pcm_bytes: bytes) -> float:
+    if len(pcm_bytes) < 2:
+        return 0.0
+    samples = struct.unpack(f"{len(pcm_bytes)//2}h", pcm_bytes)
     return math.sqrt(sum(s*s for s in samples)/len(samples))
 
-
-def parse_audio_parts(parts):
-    if len(parts) >= 3:
-        return parts[-2], parts[-1]
-    return None, None
-
-
-def gravar():
+def gravar() -> Optional[str]:
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://{G1_IP}:{PORT}")
@@ -144,73 +125,83 @@ def gravar():
     sock.setsockopt(zmq.RCVTIMEO, ZMQ_TIMEOUT * 1000)
 
     audio_buffer = bytearray()
+    last_sr = 48000
+    last_ch = 1
 
     speech_started = False
+    speech_duration = 0.0
+    silence_duration = 0.0
+
     speech_frames = 0
     silence_frames = 0
 
     print("\n[MIC] A ouvir...")
 
-    try:
-        while True:
-            try:
-                parts = sock.recv_multipart()
-            except zmq.Again:
-                continue
+    while True:
+        try:
+            parts = sock.recv_multipart()
+        except zmq.Again:
+            if speech_started and speech_duration >= VAD_MIN_SPEECH_SECS:
+                break
+            continue
 
-            if parts[0] != AUDIO_TOPIC:
-                continue
+        if not parts or parts[0] != AUDIO_TOPIC:
+            continue
 
-            header, pcm = parse_audio_parts(parts)
+        _, header, pcm_compressed = parts
 
-            try:
-                pcm = lz4.frame.decompress(pcm)
-            except:
-                continue
+        if header and len(header) >= 5:
+            last_sr = int.from_bytes(header[:4], "little")
+            last_ch = header[4]
 
-            rms = calcular_rms(pcm)
+        try:
+            pcm = lz4.frame.decompress(pcm_compressed)
+        except:
+            continue
 
-            if rms > VAD_THRESHOLD:
-                speech_frames += 1
-                silence_frames = 0
-            else:
-                silence_frames += 1
-                speech_frames = 0
+        chunk_secs = (len(pcm)//2) / last_sr
+        rms = calcular_rms(pcm)
 
-            is_speech = speech_frames >= 3
-            is_silence = silence_frames >= 8
+        if rms > VAD_THRESHOLD:
+            speech_frames += 1
+            silence_frames = 0
+        else:
+            silence_frames += 1
+            speech_frames = 0
 
-            if is_speech:
-                if not speech_started:
-                    speech_started = True
-                    print("[MIC] Voz detetada")
-                audio_buffer.extend(pcm)
+        is_speech = speech_frames >= 3
+        is_silence = silence_frames >= 8
 
-            elif speech_started:
-                audio_buffer.extend(pcm)
+        if is_speech:
+            if not speech_started:
+                print("[MIC] Voz detetada")
+                speech_started = True
+            silence_duration = 0
+            speech_duration += chunk_secs
+            audio_buffer.extend(pcm)
 
-                if is_silence:
-                    print("[MIC] Silencio -> processar")
-                    break
+        elif speech_started:
+            silence_duration += chunk_secs
+            audio_buffer.extend(pcm)
 
-        if not audio_buffer:
-            return None
+            if is_silence and silence_duration >= VAD_SILENCE_SECS:
+                break
 
-        with wave.open(AUDIO_TEMP, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(48000)
-            wf.writeframes(audio_buffer)
+    if not audio_buffer:
+        return None
 
-        return AUDIO_TEMP
+    with wave.open(AUDIO_TEMP, "wb") as wf:
+        wf.setnchannels(last_ch)
+        wf.setsampwidth(2)
+        wf.setframerate(last_sr)
+        wf.writeframes(audio_buffer)
 
-    finally:
-        sock.close()
-        ctx.term()
+    return AUDIO_TEMP
 
-
-# ================= TTS =================
-def falar(texto):
+# ==============================================================================
+# TTS
+# ==============================================================================
+def falar(texto: str):
     async def _run():
         await edge_tts.Communicate(texto, "pt-PT-DuarteNeural").save(AUDIO_RESP)
 
@@ -223,29 +214,46 @@ def falar(texto):
         pygame.time.Clock().tick(10)
     pygame.mixer.quit()
 
+# ==============================================================================
+# FRASES
+# ==============================================================================
+NOME_TARGET = {
+    "BOLA_DE_TENIS": "a bola de ténis",
+    "CUBO_DE_RUBIK": "o cubo mágico",
+    "PASTA_DE_DENTES": "a pasta de dentes",
+    "NENHUM": "isso",
+}
 
-# ================= FRASES =================
 def frase_confirmacao(action, target):
-    return f"Queres que eu execute {action} com {target}?"
+    nome = NOME_TARGET.get(target, "o objeto")
+    return f"Queres que eu vá buscar {nome}?"
 
 def frase_execucao(action, target):
-    return f"Ok! Vou executar {action}."
+    nome = NOME_TARGET.get(target, "o objeto")
+    return f"Ok! Vou tratar de {nome}."
 
 def frase_imediata(action):
-    return f"Ok! {action}."
+    return {
+        "ANDAR": "Ok, a andar!",
+        "PARAR": "Ok, paro aqui.",
+        "RECUAR": "Ok, a recuar.",
+    }.get(action, "Ok!")
 
-
-# ================= MAIN =================
+# ==============================================================================
+# MAIN
+# ==============================================================================
 def main():
+    print("Sistema pronto")
+
     whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 
     participant = DomainParticipant()
-    topic = Topic(participant, TOPIC_NAME, HRICommand)
+    topic = Topic(participant, "HRICommands", HRICommand)
     writer = DataWriter(participant, topic)
 
     pending = None
-
-    print("Sistema pronto\n")
+    pending_time = None
+    last_text = ""
 
     while True:
         ficheiro = gravar()
@@ -255,26 +263,67 @@ def main():
         segs, _ = whisper.transcribe(ficheiro, language="pt")
         texto = "".join(s.text for s in segs).strip()
 
+        # 🔥 anti repetição simples
+        if texto == last_text:
+            continue
+        last_text = texto
+
+        if not texto:
+            continue
+
         print("[USER]", texto)
 
-        action, target = classificar(texto)
-        print("[CLASS]", action, target)
+        result = classificar(texto)
+        action = result["action"]
+        target = result["target"]
 
-        if action == "CONFIRMAR" and pending:
-            print("[EXECUTAR]")
-            falar(frase_execucao(pending[0], pending[1]))
+        resposta = None
+
+        # timeout de pending
+        if pending and (time.time() - pending_time > PENDING_TIMEOUT_SEC):
+            print("[PENDING] expirou")
             pending = None
 
+        if action == "CONFIRMAR" and pending:
+            cmd = HRICommand(
+                source="HRI",
+                original_text=texto,
+                action=pending["action"],
+                target=pending["target"],
+                confirmed=True,
+                timestamp=datetime.now().isoformat()
+            )
+            writer.write(cmd)
+
+            resposta = frase_execucao(pending["action"], pending["target"])
+            pending = None
+
+        elif action == "CANCELAR":
+            pending = None
+            resposta = "Ok, cancelado."
+
         elif action in ACOES_COM_CONFIRMACAO:
-            pending = (action, target)
-            falar(frase_confirmacao(action, target))
+            pending = {"action": action, "target": target}
+            pending_time = time.time()
+            resposta = frase_confirmacao(action, target)
 
         elif action in ACOES_IMEDIATAS:
-            falar(frase_imediata(action))
+            cmd = HRICommand(
+                source="HRI",
+                original_text=texto,
+                action=action,
+                target=target,
+                confirmed=True,
+                timestamp=datetime.now().isoformat()
+            )
+            writer.write(cmd)
+            resposta = frase_imediata(action)
 
         else:
-            falar("Não percebi, podes repetir?")
+            resposta = "Não percebi, podes repetir?"
 
+        print("[ROBOT]", resposta)
+        falar(resposta)
 
 if __name__ == "__main__":
     main()
