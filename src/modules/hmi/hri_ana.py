@@ -46,7 +46,7 @@ G1_IP          = "192.168.123.164"
 PORT           = 5556
 ZMQ_TIMEOUT    = 5
 
-VAD_THRESHOLD       = 6000   # aumenta se apanhar ruido dos motores
+VAD_THRESHOLD       = 3500   # aumenta se apanhar ruido dos motores
 VAD_SILENCE_SECS    = 1.2
 VAD_MIN_SPEECH_SECS = 0.4
 
@@ -88,8 +88,9 @@ def contem(texto: str, frase: str) -> bool:
     return bool(re.search(r"(?<![a-z])" + re.escape(frase) + r"(?![a-z])", texto))
 
 REGRAS = [
-    (["vai buscar", "ir buscar", "busca"],               "IR_BUSCAR",          None),
-    (["traz", "traze", "traga"],                         "TRAZER",             None),
+    (["vai buscar", "ir buscar", "busca", "vai ate",
+      "vai la buscar", "atras da", "vai la"],             "IR_BUSCAR",          None),
+    (["traz", "traze", "traga", "traz-me"],               "TRAZER",             None),
     (["agarra", "pega", "apanha"],                       "AGARRAR",            None),
     (["larga", "larga isso", "larga ai"],                "LARGAR",             None),
     (["anda", "avanca", "vai para a frente", "caminha"], "ANDAR",              "NENHUM"),
@@ -106,8 +107,9 @@ REGRAS = [
     (["como estas", "estado atual"],                     "ESTADO_ATUAL",       "NENHUM"),
     (["repete", "diz outra vez"],                        "REPETIR",            "NENHUM"),
     (["sim", "claro", "faz isso", "ok", "pode ser",
-      "isso mesmo", "exato", "vai", "faz",
-      "por favor", "faz favor", "quero", "exatamente"],  "CONFIRMAR",          "NENHUM"),
+      "isso mesmo", "exato", "faz isso",
+      "por favor", "faz favor", "quero sim", "exatamente",
+      "confirmo", "confirma"],                            "CONFIRMAR",          "NENHUM"),
     (["nao", "cancela", "esquece", "afinal nao"],        "CANCELAR",           "NENHUM"),
 ]
 
@@ -186,7 +188,45 @@ def parse_audio_parts(parts):
         return None, header, b"".join(rest)
     return None, None, None
 
-def gravar() -> Optional[str]:
+def calibrar_threshold(sock, duracao_secs=2.0) -> float:
+    """
+    Ouve o ambiente durante duracao_secs sem ninguem a falar
+    e devolve um threshold adaptativo = ruido_base * 2.5
+    """
+    print(f"[MIC] A calibrar ruido de fundo ({duracao_secs}s)...")
+    rms_values = []
+    t_inicio = time.time()
+
+    while time.time() - t_inicio < duracao_secs:
+        try:
+            parts = sock.recv_multipart()
+        except zmq.Again:
+            continue
+
+        if not parts or parts[0] != AUDIO_TOPIC:
+            continue
+
+        _, header, pcm_compressed = parse_audio_parts(parts)
+        try:
+            pcm = lz4.frame.decompress(pcm_compressed)
+            if pcm:
+                rms_values.append(calcular_rms(pcm))
+        except Exception:
+            continue
+
+    if not rms_values:
+        print("[MIC] Calibracao falhou, a usar threshold padrao.")
+        return 6000.0
+
+    ruido_base = sum(rms_values) / len(rms_values)
+    threshold = ruido_base * 2.5
+    print(f"[MIC] Ruido base={ruido_base:.0f}  Threshold={threshold:.0f}")
+    return max(threshold, 1000.0)  # minimo de seguranca
+
+
+def gravar(threshold_adaptativo: Optional[float] = None) -> Optional[str]:
+    threshold = threshold_adaptativo if threshold_adaptativo else VAD_THRESHOLD
+
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://{G1_IP}:{PORT}")
@@ -236,7 +276,7 @@ def gravar() -> Optional[str]:
             chunk_secs = (len(pcm) // 2) / last_sr
             rms = calcular_rms(pcm)
 
-            if rms > VAD_THRESHOLD:
+            if rms > threshold:
                 speech_frames += 1
                 silence_frames = 0
             else:
@@ -390,9 +430,21 @@ def main():
     print("   SISTEMA HRI -- UNITREE G1  (Ctrl+C para sair)")
     print("=" * 52 + "\n")
 
+    # Calibracao adaptativa — mede o ruido dos motores uma vez
+    print("[CALIBRACAO] Nao fales durante 2 segundos...")
+    ctx_cal = zmq.Context()
+    sock_cal = ctx_cal.socket(zmq.SUB)
+    sock_cal.connect(f"tcp://{G1_IP}:{PORT}")
+    sock_cal.setsockopt(zmq.SUBSCRIBE, AUDIO_TOPIC)
+    sock_cal.setsockopt(zmq.RCVTIMEO, ZMQ_TIMEOUT * 1000)
+    threshold_adaptativo = calibrar_threshold(sock_cal, duracao_secs=2.0)
+    sock_cal.close()
+    ctx_cal.term()
+    print(f"[CALIBRACAO] Pronto! Threshold definido em {threshold_adaptativo:.0f}\n")
+
     try:
         while True:
-            ficheiro = gravar()
+            ficheiro = gravar(threshold_adaptativo)
             if not ficheiro:
                 continue
 
