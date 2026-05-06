@@ -39,7 +39,7 @@ VAD_THRESHOLD = 3500
 VAD_SILENCE_SECS = 1.2
 VAD_MIN_SPEECH_SECS = 0.4
 
-PENDING_TIMEOUT_SEC = 6  # 🔥 IMPORTANTE
+PENDING_TIMEOUT_SEC = 6
 
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
 ACOES_IMEDIATAS = {"ANDAR", "PARAR", "RECUAR"}
@@ -148,6 +148,7 @@ def gravar() -> Optional[str]:
         if not parts or parts[0] != AUDIO_TOPIC:
             continue
 
+        # FIX ZMQ (variável)
         header = parts[1]
         pcm_compressed = b"".join(parts[2:])
 
@@ -177,6 +178,7 @@ def gravar() -> Optional[str]:
             if not speech_started:
                 print("[MIC] Voz detetada")
                 speech_started = True
+
             silence_duration = 0
             speech_duration += chunk_secs
             audio_buffer.extend(pcm)
@@ -264,7 +266,6 @@ def main():
         segs, _ = whisper.transcribe(ficheiro, language="pt")
         texto = "".join(s.text for s in segs).strip()
 
-        # 🔥 anti repetição simples
         if texto == last_text:
             continue
         last_text = texto
@@ -280,8 +281,8 @@ def main():
 
         resposta = None
 
-        # timeout de pending
-        nding and (time.time() - pending_time > PENDING_TIMEOUT_SEC):
+        # FIX timeout seguro
+        if pending and pending_time is not None and (time.time() - pending_time > PENDING_TIMEOUT_SEC):
             print("[PENDING] expirou")
             pending = None
 
