@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
-"""
-hri_unitree.py -- Sistema HRI completo para o Robo Unitree G1
-Audio:         ZMQ com VAD melhorado (versao corrigida no lab)
-Classificacao: palavras-chave instantanea
-Confirmacao:   maquina de estados
-Conversa:      Ollama local
-"""
-
-import os
-import re
-import sys
-import math
-import struct
-import asyncio
-import unicodedata
-import zmq
-import lz4.frame
-import wave
-import time
+import os, re, sys, math, struct, asyncio, unicodedata
+import zmq, lz4.frame, wave, time
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
@@ -31,27 +14,20 @@ from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
 
-
-# ==============================================================================
-# CONFIGURACAO
-# ==============================================================================
 WHISPER_MODEL  = "medium"
 OLLAMA_MODEL   = "qwen2.5:1.5b"
 TOPIC_NAME     = "HRICommands"
 AUDIO_TEMP     = "temp_hri.wav"
 AUDIO_RESP     = "resposta_hri.mp3"
-
 AUDIO_TOPIC    = b"g1_audio"
 G1_IP          = "192.168.123.164"
 PORT           = 5556
 ZMQ_TIMEOUT    = 5
-
-VAD_THRESHOLD       = 3500   # aumenta se apanhar ruido dos motores
+VAD_THRESHOLD       = 3500
 VAD_SILENCE_SECS    = 1.2
 VAD_MIN_SPEECH_SECS = 0.4
 
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
-
 ACOES_IMEDIATAS = {
     "ANDAR", "PARAR", "RECUAR", "LEVANTAR", "SENTAR",
     "VIRAR_ESQUERDA", "VIRAR_DIREITA", "OLHAR_INTERLOCUTOR",
@@ -59,10 +35,6 @@ ACOES_IMEDIATAS = {
     "ESTADO_ATUAL", "REPETIR", "LARGAR",
 }
 
-
-# ==============================================================================
-# 1. TIPO DDS
-# ==============================================================================
 @dataclass
 class HRICommand(IdlStruct):
     source: str
@@ -72,161 +44,86 @@ class HRICommand(IdlStruct):
     confirmed: bool
     timestamp: str
 
+def normalizar(texto):
+    return "".join(c for c in unicodedata.normalize("NFD", texto.lower()) if unicodedata.category(c) != "Mn")
 
-# ==============================================================================
-# 2. CLASSIFICADOR DE PALAVRAS-CHAVE
-# ==============================================================================
-def normalizar(texto: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFD", texto.lower())
-        if unicodedata.category(c) != "Mn"
-    )
-
-def contem(texto: str, frase: str) -> bool:
+def contem(texto, frase):
     if " " in frase:
         return frase in texto
     return bool(re.search(r"(?<![a-z])" + re.escape(frase) + r"(?![a-z])", texto))
 
 REGRAS = [
-    (["vai buscar", "ir buscar", "busca", "vai ate",
-      "vai la buscar", "atras da", "vai la"],             "IR_BUSCAR",          None),
-    (["traz", "traze", "traga", "traz-me"],               "TRAZER",             None),
-    (["agarra", "pega", "apanha"],                       "AGARRAR",            None),
-    (["larga", "larga isso", "larga ai"],                "LARGAR",             None),
-    (["anda", "avanca", "vai para a frente", "caminha"], "ANDAR",              "NENHUM"),
-    (["para", "stop", "fica quieto"],                    "PARAR",              "NENHUM"),
-    (["recua", "vai para tras"],                         "RECUAR",             "NENHUM"),
-    (["vira a esquerda", "esquerda"],                    "VIRAR_ESQUERDA",     "NENHUM"),
-    (["vira a direita", "direita"],                      "VIRAR_DIREITA",      "NENHUM"),
-    (["levanta", "levanta-te", "levanta te"],            "LEVANTAR",           "NENHUM"),
-    (["senta", "senta-te", "senta te"],                  "SENTAR",             "NENHUM"),
-    (["olha para mim", "olha para a pessoa"],            "OLHAR_INTERLOCUTOR", "NENHUM"),
-    (["olha em frente", "olha para a frente"],           "OLHAR_FRENTE",       "NENHUM"),
-    (["cumprimenta", "cumprimento", "ola"],               "CUMPRIMENTAR",       "NENHUM"),
-    (["quem es", "apresenta-te", "como te chamas"],      "APRESENTAR",         "NENHUM"),
-    (["como estas", "estado atual"],                     "ESTADO_ATUAL",       "NENHUM"),
-    (["repete", "diz outra vez"],                        "REPETIR",            "NENHUM"),
+    (["vai buscar", "ir buscar", "busca", "vai ate", "atras da"], "IR_BUSCAR", None),
+    (["traz", "traze", "traga"],                                  "TRAZER",    None),
+    (["agarra", "pega", "apanha"],                                "AGARRAR",   None),
+    (["larga"],                                                   "LARGAR",    None),
+    (["anda", "avanca", "vai para a frente"],                     "ANDAR",     "NENHUM"),
+    (["para", "stop"],                                            "PARAR",     "NENHUM"),
+    (["recua", "vai para tras"],                                  "RECUAR",    "NENHUM"),
+    (["vira a esquerda", "esquerda"],                             "VIRAR_ESQUERDA", "NENHUM"),
+    (["vira a direita", "direita"],                               "VIRAR_DIREITA",  "NENHUM"),
+    (["levanta"],                                                 "LEVANTAR",  "NENHUM"),
+    (["senta"],                                                   "SENTAR",    "NENHUM"),
+    (["olha para mim"],                                           "OLHAR_INTERLOCUTOR", "NENHUM"),
+    (["olha em frente", "olha para a frente"],                    "OLHAR_FRENTE", "NENHUM"),
+    (["cumprimenta", "ola"],                                      "CUMPRIMENTAR", "NENHUM"),
+    (["quem es", "apresenta-te", "como te chamas"],               "APRESENTAR",   "NENHUM"),
+    (["como estas", "estado atual"],                              "ESTADO_ATUAL", "NENHUM"),
+    (["repete", "diz outra vez"],                                 "REPETIR",      "NENHUM"),
     (["sim", "claro", "faz isso", "ok", "pode ser",
-      "isso mesmo", "exato", "faz isso",
-      "por favor", "faz favor", "quero sim", "exatamente",
-      "confirmo", "confirma"],                            "CONFIRMAR",          "NENHUM"),
-    (["nao", "cancela", "esquece", "afinal nao"],        "CANCELAR",           "NENHUM"),
+      "exato", "por favor", "faz favor", "confirmo"],             "CONFIRMAR",    "NENHUM"),
+    (["nao", "cancela", "esquece", "afinal nao"],                 "CANCELAR",     "NENHUM"),
 ]
 
 REGRAS_TARGET = [
-    (["bola de tenis", "bola", "tenis", "boletenas"],   "BOLA_DE_TENIS"),
+    (["bola de tenis", "bola", "tenis", "boletenas"], "BOLA_DE_TENIS"),
     (["cubo de rubik", "cubo magico", "cubo", "rubik"], "CUBO_DE_RUBIK"),
-    (["pasta de dentes", "pasta", "dentes"],            "PASTA_DE_DENTES"),
+    (["pasta de dentes", "pasta", "dentes"], "PASTA_DE_DENTES"),
 ]
 
-def classificar(texto: str) -> dict:
+def classificar(texto):
     t = normalizar(texto)
-    action = "DESCONHECIDA"
-    target = "NENHUM"
-
+    action, target = "DESCONHECIDA", "NENHUM"
     for palavras, tgt in REGRAS_TARGET:
         if any(contem(t, p) for p in palavras):
             target = tgt
             break
-
-    for palavras, act, tgt_override in REGRAS:
+    for palavras, act, override in REGRAS:
         if any(contem(t, p) for p in palavras):
             action = act
-            if tgt_override is not None:
-                target = tgt_override
+            if override is not None:
+                target = override
             break
-
     if action in ACOES_COM_CONFIRMACAO and target == "NENHUM":
         target = "DESCONHECIDO"
-
     return {"action": action, "target": target}
 
-
-# ==============================================================================
-# 3. CONVERSA COM OLLAMA
-# ==============================================================================
 SYSTEM_PROMPT = (
     "Tu es o Johnny, um robo Unitree em Portugal. "
     "Fala sempre em Portugues de Portugal (pt-PT). Se muito breve e simpatico. "
-    "Nunca uses mais de 2 frases seguidas. "
-    "Se nao perceberes o comando, diz que nao percebeste e pede para repetir."
+    "Nunca uses mais de 2 frases."
 )
 
-def conversar(historico: list) -> str:
-    print("A pensar...", end="", flush=True)
+def conversar(historico):
     try:
-        resposta = ollama_client.chat(model=OLLAMA_MODEL, messages=historico)
-        texto = resposta["message"]["content"].strip()
-        print("\r                    \r", end="")
-        return texto
+        r = ollama_client.chat(model=OLLAMA_MODEL, messages=historico)
+        return r["message"]["content"].strip()
     except Exception as e:
-        print(f"\n[ERRO Ollama] {e}")
         return "Desculpa, tive um problema."
 
-
-# ==============================================================================
-# 4. AUDIO — ZMQ com VAD melhorado (versao corrigida no lab)
-# ==============================================================================
-def calcular_rms(pcm_bytes: bytes) -> float:
-    if len(pcm_bytes) < 2:
-        return 0.0
+def calcular_rms(pcm_bytes):
+    if len(pcm_bytes) < 2: return 0.0
     samples = struct.unpack(f"{len(pcm_bytes)//2}h", pcm_bytes)
     return math.sqrt(sum(s*s for s in samples) / len(samples))
 
 def parse_audio_parts(parts):
-    if len(parts) == 4:
-        _, _, header, pcm = parts
-        return None, header, pcm
-    if len(parts) > 4:
-        _, _, header, *rest = parts
-        return None, header, b"".join(rest)
-    if len(parts) == 3:
-        _, header, pcm = parts
-        return None, header, pcm
-    if len(parts) > 3:
-        _, header, *rest = parts
-        return None, header, b"".join(rest)
+    if len(parts) == 4: return None, parts[2], parts[3]
+    if len(parts) > 4:  return None, parts[2], b"".join(parts[3:])
+    if len(parts) == 3: return None, parts[1], parts[2]
+    if len(parts) > 3:  return None, parts[1], b"".join(parts[2:])
     return None, None, None
 
-def calibrar_threshold(sock, duracao_secs=2.0) -> float:
-    """
-    Ouve o ambiente durante duracao_secs sem ninguem a falar
-    e devolve um threshold adaptativo = ruido_base * 2.5
-    """
-    print(f"[MIC] A calibrar ruido de fundo ({duracao_secs}s)...")
-    rms_values = []
-    t_inicio = time.time()
-
-    while time.time() - t_inicio < duracao_secs:
-        try:
-            parts = sock.recv_multipart()
-        except zmq.Again:
-            continue
-
-        if not parts or parts[0] != AUDIO_TOPIC:
-            continue
-
-        _, header, pcm_compressed = parse_audio_parts(parts)
-        try:
-            pcm = lz4.frame.decompress(pcm_compressed)
-            if pcm:
-                rms_values.append(calcular_rms(pcm))
-        except Exception:
-            continue
-
-    if not rms_values:
-        print("[MIC] Calibracao falhou, a usar threshold padrao.")
-        return 6000.0
-
-    ruido_base = sum(rms_values) / len(rms_values)
-    threshold = ruido_base * 2.5
-    print(f"[MIC] Ruido base={ruido_base:.0f}  Threshold={threshold:.0f}")
-    return max(threshold, 1000.0)  # minimo de seguranca
-
-
-def gravar(threshold_adaptativo: Optional[float] = None) -> Optional[str]:
-    threshold = threshold_adaptativo if threshold_adaptativo else VAD_THRESHOLD
-
+def gravar():
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://{G1_IP}:{PORT}")
@@ -234,24 +131,18 @@ def gravar(threshold_adaptativo: Optional[float] = None) -> Optional[str]:
     sock.setsockopt(zmq.RCVTIMEO, ZMQ_TIMEOUT * 1000)
 
     audio_buffer = bytearray()
-    last_sr = 48000
-    last_ch = 1
-
+    last_sr, last_ch = 48000, 1
     speech_started = False
-    speech_duration = 0.0
-    silence_duration = 0.0
-    speech_frames = 0
-    silence_frames = 0
+    speech_duration = silence_duration = 0.0
+    speech_frames = silence_frames = 0
 
     print("\n[MIC] A ouvir...")
-
     try:
         while True:
             try:
                 parts = sock.recv_multipart()
             except zmq.Again:
                 if speech_started and speech_duration >= VAD_MIN_SPEECH_SECS:
-                    print("[MIC] Timeout -> processar")
                     break
                 continue
 
@@ -259,31 +150,26 @@ def gravar(threshold_adaptativo: Optional[float] = None) -> Optional[str]:
                 continue
 
             _, header, pcm_compressed = parse_audio_parts(parts)
-
             if header and len(header) >= 5:
                 last_sr = int.from_bytes(header[:4], "little")
                 last_ch = header[4]
 
             try:
                 pcm = lz4.frame.decompress(pcm_compressed)
-            except Exception as e:
-                print("[ERRO LZ4]", e)
+            except:
                 continue
-
             if not pcm:
                 continue
 
             chunk_secs = (len(pcm) // 2) / last_sr
             rms = calcular_rms(pcm)
 
-            if rms > threshold:
-                speech_frames += 1
-                silence_frames = 0
+            if rms > VAD_THRESHOLD:
+                speech_frames += 1; silence_frames = 0
             else:
-                silence_frames += 1
-                speech_frames = 0
+                silence_frames += 1; speech_frames = 0
 
-            is_speech = speech_frames >= 3
+            is_speech  = speech_frames >= 3
             is_silence = silence_frames >= 8
 
             if is_speech:
@@ -293,44 +179,32 @@ def gravar(threshold_adaptativo: Optional[float] = None) -> Optional[str]:
                 silence_duration = 0.0
                 speech_duration += chunk_secs
                 audio_buffer.extend(pcm)
-
             elif speech_started:
                 silence_duration += chunk_secs
                 audio_buffer.extend(pcm)
-
                 if is_silence and silence_duration >= VAD_SILENCE_SECS:
                     if speech_duration >= VAD_MIN_SPEECH_SECS:
                         print("[MIC] Silencio -> processar")
                         break
                     else:
-                        print("[MIC] Ruido ignorado")
                         audio_buffer.clear()
                         speech_started = False
-                        speech_duration = 0.0
-                        silence_duration = 0.0
-                        speech_frames = 0
-                        silence_frames = 0
+                        speech_duration = silence_duration = 0.0
+                        speech_frames = silence_frames = 0
 
         if not audio_buffer:
             return None
-
         with wave.open(AUDIO_TEMP, "wb") as wf:
-            wf.setnchannels(last_ch)
-            wf.setsampwidth(2)
-            wf.setframerate(last_sr)
-            wf.writeframes(audio_buffer)
-
+            wf.setnchannels(last_ch); wf.setsampwidth(2)
+            wf.setframerate(last_sr); wf.writeframes(audio_buffer)
         return AUDIO_TEMP
-
     finally:
-        sock.close()
-        ctx.term()
+        sock.close(); ctx.term()
 
-
-def falar(texto: str) -> None:
-    async def _gerar():
+def falar(texto):
+    async def _g():
         await edge_tts.Communicate(texto, "pt-PT-DuarteNeural").save(AUDIO_RESP)
-    asyncio.run(_gerar())
+    asyncio.run(_g())
     pygame.mixer.init()
     pygame.mixer.music.load(AUDIO_RESP)
     pygame.mixer.music.play()
@@ -338,157 +212,100 @@ def falar(texto: str) -> None:
         pygame.time.Clock().tick(10)
     pygame.mixer.quit()
 
-
-# ==============================================================================
-# 5. DDS
-# ==============================================================================
-def publicar_dds(writer, texto: str, action: str, target: str) -> None:
-    cmd = HRICommand(
-        source="HRI",
-        original_text=texto,
-        action=action,
-        target=target,
-        confirmed=True,
-        timestamp=datetime.now().isoformat(timespec="seconds"),
-    )
+def publicar_dds(writer, texto, action, target):
+    cmd = HRICommand(source="HRI", original_text=texto, action=action, target=target,
+                     confirmed=True, timestamp=datetime.now().isoformat(timespec="seconds"))
     writer.write(cmd)
     print(f"[DDS] PUBLICADO -- action={action}  target={target}")
 
-
 NOME_TARGET = {
-    "BOLA_DE_TENIS":   "a bola de tenis",
-    "CUBO_DE_RUBIK":   "o cubo magico",
-    "PASTA_DE_DENTES": "a pasta de dentes",
-    "DESCONHECIDO":    "o objeto",
-    "NENHUM":          "isso",
+    "BOLA_DE_TENIS": "a bola de tenis", "CUBO_DE_RUBIK": "o cubo magico",
+    "PASTA_DE_DENTES": "a pasta de dentes", "DESCONHECIDO": "o objeto", "NENHUM": "isso",
 }
 
-def frase_confirmacao(action: str, target: str) -> str:
+def frase_confirmacao(action, target):
     nome = NOME_TARGET.get(target, "o objeto")
-    if action == "TRAZER":
-        return f"Queres que eu traga {nome}?"
-    elif action == "IR_BUSCAR":
-        return f"Queres que eu va buscar {nome}?"
-    elif action == "AGARRAR":
-        return f"Queres que eu agarre {nome}?"
+    if action == "TRAZER":    return f"Queres que eu traga {nome}?"
+    if action == "IR_BUSCAR": return f"Queres que eu va buscar {nome}?"
+    if action == "AGARRAR":   return f"Queres que eu agarre {nome}?"
     return f"Confirmas a acao com {nome}?"
 
-def frase_execucao(action: str, target: str) -> str:
+def frase_execucao(action, target):
     nome = NOME_TARGET.get(target, "o objeto")
-    if action == "TRAZER":
-        return f"Combinado! Vou ja trazer {nome}."
-    elif action == "IR_BUSCAR":
-        return f"Combinado! Vou ja buscar {nome}."
-    elif action == "AGARRAR":
-        return f"Combinado! Vou agarrar {nome}."
+    if action == "TRAZER":    return f"Combinado! Vou ja trazer {nome}."
+    if action == "IR_BUSCAR": return f"Combinado! Vou ja buscar {nome}."
+    if action == "AGARRAR":   return f"Combinado! Vou agarrar {nome}."
     return "Combinado, vou ja!"
 
-def frase_imediata(action: str) -> str:
+def frase_imediata(action):
     return {
-        "ANDAR":              "Ok, a andar!",
-        "PARAR":              "Ok, paro aqui.",
-        "RECUAR":             "Ok, a recuar.",
-        "LEVANTAR":           "Ok, a levantar!",
-        "SENTAR":             "Ok, a sentar.",
-        "VIRAR_ESQUERDA":     "Ok, a virar a esquerda.",
-        "VIRAR_DIREITA":      "Ok, a virar a direita.",
-        "OLHAR_INTERLOCUTOR": "Ok, a olhar para ti.",
-        "OLHAR_FRENTE":       "Ok, a olhar em frente.",
-        "CUMPRIMENTAR":       "Ola! Muito prazer!",
-        "APRESENTAR":         "Ola! Sou o Johnny, um robo Unitree. E um prazer conhecer-te!",
-        "ESTADO_ATUAL":       "Estou operacional e pronto para ajudar!",
-        "REPETIR":            "Claro, repito!",
-        "LARGAR":             "Ok, a largar!",
+        "ANDAR": "Ok, a andar!", "PARAR": "Ok, paro aqui.", "RECUAR": "Ok, a recuar.",
+        "LEVANTAR": "Ok, a levantar!", "SENTAR": "Ok, a sentar.",
+        "VIRAR_ESQUERDA": "Ok, a virar a esquerda.", "VIRAR_DIREITA": "Ok, a virar a direita.",
+        "OLHAR_INTERLOCUTOR": "Ok, a olhar para ti.", "OLHAR_FRENTE": "Ok, a olhar em frente.",
+        "CUMPRIMENTAR": "Ola! Muito prazer!",
+        "APRESENTAR": "Ola! Sou o Johnny, um robo Unitree.",
+        "ESTADO_ATUAL": "Estou operacional!", "REPETIR": "Claro, repito!",
+        "LARGAR": "Ok, a largar!",
     }.get(action, "Ok!")
 
-
-# ==============================================================================
-# 6. LOOP PRINCIPAL
-# ==============================================================================
 def main():
     print("A carregar Whisper...")
     whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     print("Whisper pronto!")
 
-    print(f"A verificar Ollama ({OLLAMA_MODEL})...")
     try:
         ollama_client.chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": "ok"}])
         print("Ollama pronto!\n")
-    except Exception:
-        print(f"\n[ERRO] Nao consegui ligar ao Ollama!")
-        print(f"  ollama serve  +  ollama pull {OLLAMA_MODEL}")
-        sys.exit(1)
+    except:
+        print("ERRO: ollama serve + ollama pull qwen2.5:1.5b"); sys.exit(1)
 
     participant = DomainParticipant()
     topic = Topic(participant, TOPIC_NAME, HRICommand)
     writer = DataWriter(participant, topic)
-
     historico = [{"role": "system", "content": SYSTEM_PROMPT}]
-    pending = None  # type: Optional[dict]
+    pending = None
 
     print("=" * 52)
     print("   SISTEMA HRI -- UNITREE G1  (Ctrl+C para sair)")
     print("=" * 52 + "\n")
 
-    # Calibracao adaptativa — mede o ruido dos motores uma vez
-    print("[CALIBRACAO] Nao fales durante 2 segundos...")
-    ctx_cal = zmq.Context()
-    sock_cal = ctx_cal.socket(zmq.SUB)
-    sock_cal.connect(f"tcp://{G1_IP}:{PORT}")
-    sock_cal.setsockopt(zmq.SUBSCRIBE, AUDIO_TOPIC)
-    sock_cal.setsockopt(zmq.RCVTIMEO, ZMQ_TIMEOUT * 1000)
-    threshold_adaptativo = calibrar_threshold(sock_cal, duracao_secs=2.0)
-    sock_cal.close()
-    ctx_cal.term()
-    print(f"[CALIBRACAO] Pronto! Threshold definido em {threshold_adaptativo:.0f}\n")
-
     try:
         while True:
-            ficheiro = gravar(threshold_adaptativo)
+            ficheiro = gravar()
             if not ficheiro:
                 continue
-
             try:
-                segs, _ = whisper.transcribe(ficheiro, language="pt")
+                segs, _ = whisper.transcribe(ficheiro, language="pt",
+                                             beam_size=5, best_of=5,
+                                             temperature=0.0,
+                                             condition_on_previous_text=False)
                 texto = "".join(s.text for s in segs).strip()
-
                 if not texto:
                     print("[Whisper] Nao percebi nada.")
                     continue
 
                 print(f"[Utilizador]: {texto}")
-
                 result = classificar(texto)
                 action, target = result["action"], result["target"]
                 print(f"[Classificacao]: {action} / {target}")
-
-                resposta = None
 
                 if action == "CONFIRMAR" and pending:
                     publicar_dds(writer, pending["texto"], pending["action"], pending["target"])
                     resposta = frase_execucao(pending["action"], pending["target"])
                     pending = None
-
-                elif action == "CONFIRMAR" and not pending:
-                    resposta = "Nao ha nenhuma acao pendente para confirmar."
-
+                elif action == "CONFIRMAR":
+                    resposta = "Nao ha nenhuma acao pendente."
                 elif action == "CANCELAR" and pending:
-                    print("[X] Acao cancelada.")
-                    resposta = "Ok, fico aqui entao."
-                    pending = None
-
+                    resposta = "Ok, fico aqui entao."; pending = None
                 elif action == "CANCELAR":
                     resposta = "Ok, sem problema."
-
                 elif action in ACOES_COM_CONFIRMACAO:
                     pending = {"action": action, "target": target, "texto": texto}
-                    print(f"Pendente: {action}/{target} -- a espera de confirmacao")
                     resposta = frase_confirmacao(action, target)
-
                 elif action in ACOES_IMEDIATAS:
                     publicar_dds(writer, texto, action, target)
                     resposta = frase_imediata(action)
-
                 else:
                     historico.append({"role": "user", "content": texto})
                     resposta = conversar(historico)
@@ -496,14 +313,12 @@ def main():
 
                 print(f"[Johnny]: {resposta}")
                 falar(resposta)
-
             finally:
                 if os.path.exists(ficheiro):
                     os.remove(ficheiro)
 
     except KeyboardInterrupt:
-        print("\n\nA desligar o Johnny... Ate logo!")
-
+        print("\nA desligar o Johnny... Ate logo!")
 
 if __name__ == "__main__":
     main()
