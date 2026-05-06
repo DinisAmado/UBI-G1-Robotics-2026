@@ -43,7 +43,7 @@ G1_IP          = "192.168.123.164"
 PORT           = 5556
 ZMQ_TIMEOUT    = 5
 
-VAD_THRESHOLD       = 100  
+VAD_THRESHOLD       = 400  
 VAD_SILENCE_SECS    = 1.2
 VAD_MIN_SPEECH_SECS = 0.4
 
@@ -182,6 +182,10 @@ def gravar() -> Optional[str]:
     speech_duration = 0.0
     silence_duration = 0.0
 
+    # 🔥 NOVO: controlo de estabilidade
+    speech_frames = 0
+    silence_frames = 0
+
     print("\n[MIC] A ouvir...")
 
     try:
@@ -190,47 +194,69 @@ def gravar() -> Optional[str]:
                 parts = sock.recv_multipart()
             except zmq.Again:
                 if speech_started and speech_duration >= VAD_MIN_SPEECH_SECS:
+                    print("[MIC] Timeout -> processar")
                     break
                 continue
 
             if not parts or parts[0] != AUDIO_TOPIC:
                 continue
 
-            _, header, pcm = parse_audio_parts(parts)
+            _, header, pcm_compressed = parse_audio_parts(parts)
 
             if header and len(header) >= 5:
                 last_sr = int.from_bytes(header[:4], "little")
                 last_ch = header[4]
 
             try:
-                pcm = lz4.frame.decompress(pcm)
-            except:
+                pcm = lz4.frame.decompress(pcm_compressed)
+            except Exception as e:
+                print("[ERRO LZ4]", e)
+                continue
+
+            if not pcm:
                 continue
 
             chunk_secs = (len(pcm)//2) / last_sr
             rms = calcular_rms(pcm)
 
-            is_speech = rms > VAD_THRESHOLD
+            # 🔥 NOVO: histerese (anti-ruído)
+            if rms > VAD_THRESHOLD:
+                speech_frames += 1
+                silence_frames = 0
+            else:
+                silence_frames += 1
+                speech_frames = 0
+
+            is_speech = speech_frames >= 3     # precisa de 3 frames seguidos
+            is_silence = silence_frames >= 8   # precisa de silêncio consistente
+
+            # DEBUG (ativa se quiseres)
+            print(f"RMS={rms:.1f} speech_frames={speech_frames} silence_frames={silence_frames}")
 
             if is_speech:
-                speech_started = True
-                silence_duration = 0
+                if not speech_started:
+                    speech_started = True
+                    print("[MIC] Voz detetada")
+                silence_duration = 0.0
                 speech_duration += chunk_secs
                 audio_buffer.extend(pcm)
 
-            else:
-                if speech_started:
-                    silence_duration += chunk_secs
-                    audio_buffer.extend(pcm)
+            elif speech_started:
+                silence_duration += chunk_secs
+                audio_buffer.extend(pcm)
 
-                    if silence_duration > VAD_SILENCE_SECS:
-                        if speech_duration >= VAD_MIN_SPEECH_SECS:
-                            break
-                        else:
-                            audio_buffer.clear()
-                            speech_started = False
-                            speech_duration = 0
-                            silence_duration = 0
+                if is_silence and silence_duration >= VAD_SILENCE_SECS:
+                    if speech_duration >= VAD_MIN_SPEECH_SECS:
+                        print("[MIC] Silencio -> processar")
+                        break
+                    else:
+                        print("[MIC] Ruido ignorado")
+                        audio_buffer.clear()
+                        speech_started = False
+                        speech_duration = 0.0
+                        silence_duration = 0.0
+                        speech_frames = 0
+                        silence_frames = 0
 
         if not audio_buffer:
             return None
