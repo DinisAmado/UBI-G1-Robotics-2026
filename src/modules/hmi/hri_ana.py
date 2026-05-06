@@ -46,7 +46,7 @@ G1_IP          = "192.168.123.164"
 PORT           = 5556
 ZMQ_TIMEOUT    = 5
 
-VAD_THRESHOLD       = 3500   # aumenta se apanhar ruido dos motores
+VAD_THRESHOLD       = 6000   # aumenta se apanhar ruido dos motores
 VAD_SILENCE_SECS    = 1.2
 VAD_MIN_SPEECH_SECS = 0.4
 
