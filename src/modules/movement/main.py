@@ -178,4 +178,4 @@ class MotionModule:
 
 if __name__ == "__main__":
     # Confirma o nome da placa de rede ligada ao robô.
-    MotionModule(network_interface="eth0").run()
+    MotionModule(network_interface="enp117s0").run()
