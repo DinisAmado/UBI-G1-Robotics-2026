@@ -247,7 +247,9 @@ class RobotController:
         last_saved_path = None
         MAP_SAVE_INTERVAL = 2.0
 
-        debug_counter = 0
+
+        last_odom_debug_time = 0.0
+        printed_odom_structure = False
 
         while True:
             step_start = time.perf_counter()
@@ -257,6 +259,15 @@ class RobotController:
             # Preferir odometria real do módulo SLAM da Unitree
             if self.current_odom is not None:
                 try:
+                    if not printed_odom_structure:
+                        printed_odom_structure = True
+                        print("\n===== DEBUG ESTRUTURA ODOM =====")
+                        print("Tipo:", type(self.current_odom))
+                        print("Campos:", dir(self.current_odom))
+                        print("Mensagem completa:")
+                        print(self.current_odom)
+                        print("================================\n")
+
                     pose = self.current_odom.pose.pose
 
                     self.pos_x = float(pose.position.x)
@@ -302,11 +313,15 @@ class RobotController:
                 # ---------------------------------------------------
                 curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
 
-                debug_counter += 1
+                now_debug = time.time()
 
-                if debug_counter >= 100:
-                    debug_counter = 0
-                    print(f"ODOM pos=({self.pos_x:.2f}, {self.pos_y:.2f}) yaw={yaw:.2f}")
+                if now_debug - last_odom_debug_time >= 1.0:
+                    last_odom_debug_time = now_debug
+
+                    if self.current_odom is not None:
+                        print(f"ODOM RECEBIDA | pos=({self.pos_x:.3f}, {self.pos_y:.3f}) yaw={yaw:.3f}")
+                    else:
+                        print("ODOM NÃO RECEBIDA | a usar fallback da IMU/pose inicial")
 
                 xyz = None
 
