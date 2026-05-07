@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MOTI
 log = logging.getLogger("motion")
 
 class MotionModule:
-    def __init__(self, network_interface="eth0"):   # alterar para a placa de rede correta
+    def __init__(self, network_interface="enp117s0"):   # alterar para a placa de rede correta
         self.is_active = False  
         self.seq = 0
         
