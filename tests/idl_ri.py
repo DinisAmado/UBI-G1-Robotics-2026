@@ -177,12 +177,12 @@ class GoalType(IdlEnum):
     POSE  = auto()
 
 
-@dataclass
 class GoalData(IdlUnion, typename="rt.nav.GoalData", discriminator=GoalType):
     name: case[GoalType.NAMED, str]  = ""
     pose: case[GoalType.POSE,  Pose] = field(default_factory=Pose)
 
 
+@dataclass
 class NavGoal(IdlStruct, typename="rt.nav.Goal"):
     header: Header   = field(default_factory=Header)
     data:   GoalData = field(default_factory=GoalData)

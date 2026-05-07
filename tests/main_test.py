@@ -277,7 +277,7 @@ class Orchestrator:
                 log.info("Objeto '%s' localizado (conf=%.2f)", det.name, det.confidence)
                 self._w_nav_goal.write(Goal(
                     header=self._make_header(),
-                    data=GoalData(GoalType.NAMED, TABLE_LOCATION_NAME),
+                    data=GoalData(name=TABLE_LOCATION_NAME),
                 ))
                 self._transition(Phase.NAVIGATING_TO_TABLE,
                                  f"a navegar para '{TABLE_LOCATION_NAME}'")
@@ -401,7 +401,7 @@ class Orchestrator:
                 if loc.name == self._ctx.last_person_id:
                     return Goal(
                         header=self._make_header(),
-                        data=GoalData(GoalType.NAMED, loc.name),
+                        data=GoalData(name=loc.name),
                     )
         log.warning("Pessoa '%s' não encontrada nas localizações SLAM.",
                     self._ctx.last_person_id)

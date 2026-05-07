@@ -65,7 +65,7 @@ log = logging.getLogger("nav_sim")
 DOMAIN_ID    = 0
 ALVO_OBJETO  = "bola de tenis"
 ALVO_PESSOA  = "person_01"
-NAV_DURATION = 5.0     # segundos a publicar CmdVel antes de dizer DONE
+NAV_DURATION = 2.0     # segundos a publicar CmdVel antes de dizer DONE
 CMD_VEL_HZ   = 50      # frequência de publicação de CmdVel
 
 # Velocidades fixas de navegação para a mesa e para a pessoa
