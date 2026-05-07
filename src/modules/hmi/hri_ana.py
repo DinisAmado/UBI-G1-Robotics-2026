@@ -164,6 +164,8 @@ def gravar():
             chunk_secs = (len(pcm) // 2) / last_sr
             rms = calcular_rms(pcm)
 
+            print(f"RMS={rms:.1f} speech_frames={speech_frames} silence_frames={silence_frames}")
+
             if rms > VAD_THRESHOLD:
                 speech_frames += 1; silence_frames = 0
             else:
