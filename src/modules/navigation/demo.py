@@ -1,0 +1,482 @@
+"""
+demo.py
+
+1 - Em simulação:
+    abrir terminal e correr:
+        python3 demo.py
+    noutro terminal:
+        ./arranca.sh
+
+2 - No robô real:
+    correr com a interface correta:
+        python3 demo.py eth0
+    ou:
+        python3 demo.py enp...
+"""
+
+import os
+import json
+import time
+import sys
+import math
+import numpy as np
+
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import ListedColormap
+
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.utils.crc import CRC
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
+
+from slam_navigation import SLAMNavigation
+from sensores import sensor_mujoco_json, pointcloud_to_occupancy_points
+from livox_receiver import LivoxReceiver
+
+
+# ---------------------------------------------------------------
+# Configurações do mapa
+# ---------------------------------------------------------------
+MAP_ORIGIN_X = -5.0
+MAP_ORIGIN_Y = -5.0
+MAP_RESOLUTION = 0.05
+
+
+def world_to_cell(world_x, world_y):
+    cell_x = int((world_x - MAP_ORIGIN_X) / MAP_RESOLUTION)
+    cell_y = int((world_y - MAP_ORIGIN_Y) / MAP_RESOLUTION)
+    return cell_x, cell_y
+
+
+def cell_to_world(cell_x, cell_y):
+    world_x = MAP_ORIGIN_X + cell_x * MAP_RESOLUTION
+    world_y = MAP_ORIGIN_Y + cell_y * MAP_RESOLUTION
+    return world_x, world_y
+
+
+def yaw_from_quaternion(qx, qy, qz, qw):
+    """
+    Converte quaternion em yaw.
+    """
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def find_approach_goal(
+    slam,
+    table_cell,
+    robot_cell,
+    target_distance_m=0.30,
+    tolerance_m=0.10
+):
+    tx, ty = table_cell
+    rx, ry = robot_cell
+
+    target_cells = int(target_distance_m / MAP_RESOLUTION)
+    tolerance_cells = int(tolerance_m / MAP_RESOLUTION)
+
+    min_dist = max(1, target_cells - tolerance_cells)
+    max_dist = target_cells + tolerance_cells
+
+    candidates = []
+
+    for dx in range(-max_dist, max_dist + 1):
+        for dy in range(-max_dist, max_dist + 1):
+            gx = tx + dx
+            gy = ty + dy
+
+            if not (0 <= gx < slam.map_size and 0 <= gy < slam.map_size):
+                continue
+
+            dist_to_table = math.sqrt(dx * dx + dy * dy)
+
+            if dist_to_table < min_dist or dist_to_table > max_dist:
+                continue
+
+            if slam.is_occupied(gx, gy):
+                continue
+
+            dist_to_robot = math.sqrt((gx - rx) ** 2 + (gy - ry) ** 2)
+            score = abs(dist_to_table - target_cells) + 0.05 * dist_to_robot
+
+            candidates.append((score, gx, gy))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1], candidates[0][2]
+
+
+class RobotController:
+    def __init__(self):
+        self.current_state = None
+        self.current_odom = None
+        self.crc = CRC()
+
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+
+    def LowStateHandler(self, msg: LowState_):
+        self.current_state = msg
+
+    def OdomHandler(self, msg: Odometry_):
+        self.current_odom = msg
+
+    def run(self):
+        plt.close('all')
+
+        real_robot = len(sys.argv) >= 2
+
+        if real_robot:
+            interface = sys.argv[1]
+            print(f"Modo robô real na interface: {interface}")
+            ChannelFactoryInitialize(0, interface)
+        else:
+            print("Modo simulação")
+            ChannelFactoryInitialize(1, "lo")
+
+        low_state_sub = ChannelSubscriber("rt/lowstate", LowState_)
+        low_state_sub.Init(self.LowStateHandler, 10)
+
+        odom_sub = ChannelSubscriber("rt/unitree/slam_mapping/odom", Odometry_)
+        odom_sub.Init(self.OdomHandler, 10)
+
+        low_cmd_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
+        low_cmd_pub.Init()
+
+        print("Waiting for lowstate...")
+
+        timeout = 5
+        start_time = time.time()
+
+        while self.current_state is None:
+            if time.time() - start_time > timeout:
+                print("Aviso: não recebi lowstate. Vou continuar sem bloquear.")
+                break
+            time.sleep(0.01)
+
+        print("Continuing...")
+
+        # ---------------- SLAM e Navegação ----------------
+        slam = SLAMNavigation(
+            map_size=200,
+            resolution=MAP_RESOLUTION,
+            num_rays=144,
+            max_range=100
+        )
+
+
+        lidar = None
+
+        if real_robot:
+            print("A iniciar Livox MID-360...")
+            lidar = LivoxReceiver(
+                config_path="mid360_config.json",
+                host_ip="192.168.123.165"
+            )
+            print("Livox iniciado.")
+
+
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ---------------------------------------------------
+        # Objetivo inicial
+        # No robô real começa sem objetivo conhecido.
+        # A perceção/interação deverá preencher isto depois.
+        # ---------------------------------------------------
+        table_world = None
+        table_cell = None
+        current_goal_cell = None
+        current_path = []
+
+        # Posição inicial
+        init_cell_x, init_cell_y = world_to_cell(self.pos_x, self.pos_y)
+        slam.update_pose(init_cell_x, init_cell_y, 0.0)
+
+        # ---------------- Visualização ----------------
+        custom_cmap = ListedColormap(['white', 'lightgrey', 'black'])
+
+        plt.ion()
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        img = ax.imshow(
+            slam.get_visualization_grid(),
+            cmap=custom_cmap,
+            vmin=0,
+            vmax=2,
+            origin="lower"
+        )
+
+        leg_free = mpatches.Patch(color='white', label='Livre', ec='black')
+        leg_unk = mpatches.Patch(color='lightgrey', label='Desconhecido')
+        leg_obs = mpatches.Patch(color='black', label='Obstáculo')
+
+        robot_dot, = ax.plot([], [], "ro", markersize=8, label="Robô G1")
+        robot_arrow = ax.quiver(
+            [0], [0], [0], [0],
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            color='red',
+            width=0.004
+        )
+        path_line, = ax.plot([], [], "g-", linewidth=2, label="Caminho A*")
+        goal_dot, = ax.plot([], [], "bo", markersize=6, label="Objetivo")
+
+        ax.set_title("SLAM e Navegação")
+        ax.legend(
+            handles=[leg_free, leg_unk, leg_obs, path_line, robot_dot, goal_dot],
+            loc='upper right',
+            fontsize='small'
+        )
+
+        plt.show(block=False)
+        plt.pause(0.1)
+
+        viz_counter = 0
+        last_map_save_time = 0.0
+        last_saved_path = None
+        MAP_SAVE_INTERVAL = 2.0
+
+
+        last_odom_debug_time = 0.0
+        printed_odom_structure = False
+
+        while True:
+            step_start = time.perf_counter()
+
+            yaw = 0.0
+
+            # Preferir odometria real do módulo SLAM da Unitree
+            if self.current_odom is not None:
+                try:
+                    if not printed_odom_structure:
+                        printed_odom_structure = True
+                        print("\n===== DEBUG ESTRUTURA ODOM =====")
+                        print("Tipo:", type(self.current_odom))
+                        print("Campos:", dir(self.current_odom))
+                        print("Mensagem completa:")
+                        print(self.current_odom)
+                        print("================================\n")
+
+                    pose = self.current_odom.pose.pose
+
+                    self.pos_x = float(pose.position.x)
+                    self.pos_y = float(pose.position.y)
+
+                    qx = float(pose.orientation.x)
+                    qy = float(pose.orientation.y)
+                    qz = float(pose.orientation.z)
+                    qw = float(pose.orientation.w)
+
+                    yaw = yaw_from_quaternion(qx, qy, qz, qw)
+
+                except Exception as e:
+                    print("Erro ao ler odometria:", e)
+
+                    if self.current_state and hasattr(self.current_state, 'imu_state'):
+                        yaw = self.current_state.imu_state.rpy[2]
+
+            else:
+                # Fallback: usar IMU caso ainda não haja odometria
+                if self.current_state and hasattr(self.current_state, 'imu_state'):
+                    yaw = self.current_state.imu_state.rpy[2]
+
+            # ---------------------------------------------------
+            # Sensores
+            # ---------------------------------------------------
+
+            if not real_robot:
+                # ---------------------------------------------------
+                # Simulação: ler dados do MuJoCo
+                # ---------------------------------------------------
+                mujoco_ok, mx, my, myaw, rays = sensor_mujoco_json()
+
+                if mujoco_ok:
+                    self.pos_x = mx
+                    self.pos_y = my
+                    yaw = myaw
+                    slam.update_from_mujoco_rays(rays)
+
+            else:
+                # ---------------------------------------------------
+                # Robô real: ler point cloud do Livox
+                # ---------------------------------------------------
+                curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
+
+                now_debug = time.time()
+
+                if now_debug - last_odom_debug_time >= 1.0:
+                    last_odom_debug_time = now_debug
+
+                    if self.current_odom is not None:
+                        print(f"ODOM RECEBIDA | pos=({self.pos_x:.3f}, {self.pos_y:.3f}) yaw={yaw:.3f}")
+                    else:
+                        print("ODOM NÃO RECEBIDA | a usar fallback da IMU/pose inicial")
+
+                xyz = None
+
+                if lidar is not None:
+                    xyz = lidar.get_latest_points()
+
+                if xyz is not None:
+                    obs, free = pointcloud_to_occupancy_points(
+                        xyz,
+                        curr_cell_x,
+                        curr_cell_y,
+                        yaw,
+                        map_size=slam.map_size,
+                        resolution=MAP_RESOLUTION,
+                        max_range_meters=4.0,
+                        min_z=-0.30,
+                        max_z=1.50,
+                        min_dist_m=0.20,
+                        point_step=5,
+                        apply_yaw=True
+                    )
+
+                    # Esquece gradualmente leituras antigas para evitar rastos
+                    slam.decay_map(decay_factor=0.97)
+
+                    for pt in free:
+                        slam._update_cell(pt[0], pt[1], False)
+
+                    for pt in obs:
+                        slam._update_cell(pt[0], pt[1], True)
+
+            curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
+            slam.update_pose(curr_cell_x, curr_cell_y, yaw)
+
+            # ---------------------------------------------------
+            # Visualização e planeamento
+            # ---------------------------------------------------
+            viz_counter += 1
+
+            if viz_counter >= 20:
+                viz_counter = 0
+
+                path_needs_replan = not current_path or not slam.is_path_valid(current_path)
+
+                if path_needs_replan:
+
+                    if table_cell is not None:
+                        current_goal_cell = find_approach_goal(
+                            slam=slam,
+                            table_cell=table_cell,
+                            robot_cell=(curr_cell_x, curr_cell_y),
+                            target_distance_m=0.30,
+                            tolerance_m=0.10
+                        )
+
+                        if current_goal_cell is not None:
+                            current_path = slam.plan_path(current_goal_cell)
+                        else:
+                            current_path = []
+
+                    else:
+                        current_goal_cell = None
+                        current_path = []
+
+                img.set_data(slam.get_visualization_grid())
+
+                if current_path:
+                    path_y = [p[1] for p in current_path]
+                    path_x = [p[0] for p in current_path]
+                    path_line.set_data(path_y, path_x)
+                else:
+                    path_line.set_data([], [])
+
+                robot_dot.set_data([curr_cell_y], [curr_cell_x])
+
+                arrow_len = 10  # comprimento da seta em células
+                # eixo horizontal = cell_y
+                # eixo vertical   = cell_x
+                arrow_dx = arrow_len * math.sin(yaw)
+                arrow_dy = arrow_len * math.cos(yaw)
+
+                robot_arrow.set_offsets(np.array([[curr_cell_y, curr_cell_x]]))
+                robot_arrow.set_UVC(np.array([arrow_dx]), np.array([arrow_dy]))
+
+                if current_goal_cell is not None:
+                    goal_dot.set_data([current_goal_cell[1]], [current_goal_cell[0]])
+                else:
+                    goal_dot.set_data([], [])
+
+                ax.set_xlim(curr_cell_y - 100, curr_cell_y + 100)
+                ax.set_ylim(curr_cell_x - 100, curr_cell_x + 100)
+
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                plt.pause(0.001)
+
+                now = time.time()
+
+                if now - last_map_save_time >= MAP_SAVE_INTERVAL:
+                    np.save(
+                        os.path.join(output_dir, "occupancy_grid.npy"),
+                        slam.get_probability_grid()
+                    )
+
+                    plt.imsave(
+                        os.path.join(output_dir, "map_preview.png"),
+                        slam.get_visualization_grid(),
+                        cmap=custom_cmap,
+                        vmin=0,
+                        vmax=2
+                    )
+
+                    last_map_save_time = now
+
+                if current_path and current_path != last_saved_path:
+                    path_data = {
+                        "goal_cell": {
+                            "x": int(current_goal_cell[0]),
+                            "y": int(current_goal_cell[1])
+                        },
+                        "goal_world": {
+                            "x": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[0]),
+                            "y": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[1])
+                        },
+                        "path": [
+                            {
+                                "cell_x": int(p[0]),
+                                "cell_y": int(p[1]),
+                                "world_x": float(cell_to_world(p[0], p[1])[0]),
+                                "world_y": float(cell_to_world(p[0], p[1])[1])
+                            }
+                            for p in current_path
+                        ]
+                    }
+
+                    with open(os.path.join(output_dir, "latest_path.json"), "w") as f:
+                        json.dump(path_data, f, indent=2)
+
+                    last_saved_path = list(current_path)
+
+            # ---------------------------------------------------
+            # Segurança: por agora não enviar movimento real.
+            # Mantemos LowCmd vazio como heartbeat/comunicação.
+            # Para teste totalmente passivo, comenta estas 3 linhas.
+            # ---------------------------------------------------
+            cmd = unitree_hg_msg_dds__LowCmd_()
+            cmd.crc = self.crc.Crc(cmd)
+            low_cmd_pub.Write(cmd)
+
+            elapsed = time.perf_counter() - step_start
+
+            if 0.002 - elapsed > 0:
+                time.sleep(0.002 - elapsed)
+
+
+if __name__ == '__main__':
+    RobotController().run()
+

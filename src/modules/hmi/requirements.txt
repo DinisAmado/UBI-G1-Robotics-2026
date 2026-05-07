@@ -1,0 +1,7 @@
+faster-whisper
+SpeechRecognition
+pyaudio
+pygame
+edge-tts
+cyclonedds
+ollama
