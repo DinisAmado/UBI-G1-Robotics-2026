@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 
-import os
-import re
-import math
-import struct
-import asyncio
-import unicodedata
-import zmq
-import lz4.frame
-import wave
-import time
+# python -c "import webrtcvad; print('webrtcvad OK')"
+# python -c "import zmq, lz4.frame; print('ZMQ e LZ4 OK')"
+# python -c "import cyclonedds; print('CycloneDDS OK')"
+# python -c "from faster_whisper import WhisperModel; print('Whisper OK')"
+# python -c "import ollama; print('Ollama OK')"
+
+import os, re, sys, math, struct, asyncio, unicodedata
+import zmq, lz4.frame, wave, time
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
@@ -17,36 +15,101 @@ from typing import Optional
 import pygame
 from faster_whisper import WhisperModel
 import edge_tts
+import ollama as ollama_client
 from cyclonedds.idl import IdlStruct
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
+import webrtcvad
+from collections import deque
 
-# ==============================================================================
-# CONFIG
-# ==============================================================================
-WHISPER_MODEL = "medium"
+WHISPER_MODEL  = "large-v3-turbo"
+OLLAMA_MODEL   = "qwen2.5:1.5b"
+TOPIC_NAME     = "HRICommands"
+AUDIO_TEMP     = "temp_hri.wav"
+AUDIO_RESP     = "resposta_hri.mp3"
+AUDIO_TOPIC    = b"g1_audio"
+G1_IP          = "192.168.123.164"
+PORT           = 5556
+ZMQ_TIMEOUT    = 5
+# VAD_THRESHOLD       = 4500
+# VAD_SILENCE_SECS    = 1.2
+# VAD_MIN_SPEECH_SECS = 0.4
 
-AUDIO_TEMP = "temp_hri.wav"
-AUDIO_RESP = "resposta_hri.mp3"
+# Volume mínimo (RMS) para aceitar que existe som relevante no áudio.
+# Mesmo usando WebRTC VAD, mantemos este filtro para ignorar silêncio absoluto
+# ou ruídos muito fracos.
+# Se o robô não detetar bem a fala, baixa este valor.
+# Se o robô apanhar demasiado ruído de fundo, aumenta este valor.
+VAD_RMS_MIN = 800
 
-AUDIO_TOPIC = b"g1_audio"
-G1_IP = "192.168.123.164"
-PORT = 5556
-ZMQ_TIMEOUT = 5
 
-VAD_THRESHOLD = 3500
+# Grau de agressividade do WebRTC VAD.
+# Este valor controla o quão seletivo o detetor é ao decidir se há voz humana.
+#
+# 0 = pouco agressivo: aceita mais áudio como fala, mas pode apanhar mais ruído.
+# 1 = ligeiramente mais seletivo.
+# 2 = equilibrado; boa opção inicial.
+# 3 = muito agressivo: corta mais ruído, mas pode falhar fala baixa ou distante.
+WEBRTC_VAD_MODE = 2
+
+
+# Tamanho de cada frame enviada para o WebRTC VAD, em milissegundos.
+# O WebRTC VAD só aceita frames de 10, 20 ou 30 ms.
+#
+# 30 ms costuma ser uma escolha estável porque dá ao VAD mais contexto
+# para decidir se o áudio contém voz.
+WEBRTC_FRAME_MS = 30
+
+
+# Percentagem mínima de frames classificadas como voz dentro de um chunk.
+#
+# Exemplo:
+# Se um chunk for dividido em 10 frames e este valor for 0.5,
+# pelo menos 5 dessas frames têm de ser consideradas voz para o chunk
+# ser aceite como fala.
+#
+# Valor mais baixo = mais permissivo.
+# Valor mais alto = mais exigente.
+WEBRTC_MIN_SPEECH_RATIO = 0.5
+
+
+# Tempo de silêncio, em segundos, necessário para considerar que o utilizador
+# acabou de falar e que o áudio já pode ser enviado para o Whisper.
+#
+# Se estiver muito baixo, pode cortar frases antes do fim.
+# Se estiver muito alto, o sistema demora mais a responder depois da fala.
 VAD_SILENCE_SECS = 1.2
-VAD_MIN_SPEECH_SECS = 0.4
 
-PENDING_TIMEOUT_SEC = 6
+
+# Duração mínima, em segundos, que a fala tem de ter para ser aceite.
+# Serve para ignorar ruídos curtos, estalos, cliques ou pequenas interferências.
+#
+# Se o valor for muito baixo, pode aceitar ruídos como comandos.
+# Se for muito alto, pode ignorar comandos curtos como "para" ou "sim".
+VAD_MIN_SPEECH_SECS = 0.3
+
+
+# Tempo de áudio guardado antes de o sistema detetar oficialmente a voz.
+# Isto evita cortar o início de comandos curtos, como "para", "sim" ou "não".
+PRE_BUFFER_SECS = 0.5
+
+# Ganho aplicado ao áudio antes de enviar para o Whisper.
+# Ajuda quando a voz vem baixa ou distante.
+# 1.0 = sem ganho
+# 1.5 = aumento moderado
+# 2.0 = aumento forte, mas pode distorcer
+AUDIO_GAIN = 1.6
+
 
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
-ACOES_IMEDIATAS = {"ANDAR", "PARAR", "RECUAR"}
+ACOES_IMEDIATAS = {
+    "ANDAR", "PARAR", "RECUAR", "LEVANTAR", "SENTAR",
+    "VIRAR_ESQUERDA", "VIRAR_DIREITA", "OLHAR_INTERLOCUTOR",
+    "OLHAR_FRENTE", "CUMPRIMENTAR", "APRESENTAR",
+    "ESTADO_ATUAL", "REPETIR", "LARGAR",
+}
 
-# ==============================================================================
-# DDS
-# ==============================================================================
 @dataclass
 class HRICommand(IdlStruct):
     source: str
@@ -56,68 +119,173 @@ class HRICommand(IdlStruct):
     confirmed: bool
     timestamp: str
 
-# ==============================================================================
-# NLP
-# ==============================================================================
-def normalizar(texto: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFD", texto.lower())
-        if unicodedata.category(c) != "Mn"
-    )
+def normalizar(texto):
+    return "".join(c for c in unicodedata.normalize("NFD", texto.lower()) if unicodedata.category(c) != "Mn")
 
-def contem(texto: str, frase: str) -> bool:
+def contem(texto, frase):
     if " " in frase:
         return frase in texto
     return bool(re.search(r"(?<![a-z])" + re.escape(frase) + r"(?![a-z])", texto))
 
-def classificar(texto: str) -> dict:
+REGRAS = [
+    (["traz", "traze", "traga", "traz-me", "traz me"], "TRAZER", None),
+    (["vai buscar", "ir buscar", "busca", "procura"], "IR_BUSCAR", None),
+    (["agarra", "pega", "apanha"],                                "AGARRAR",   None),
+    (["larga"],                                                   "LARGAR",    None),
+    (["anda", "avanca", "vai para a frente"],                     "ANDAR",     "NENHUM"),
+    (["para", "stop"],                                            "PARAR",     "NENHUM"),
+    (["recua", "vai para tras"],                                  "RECUAR",    "NENHUM"),
+    (["vira a esquerda", "esquerda"],                             "VIRAR_ESQUERDA", "NENHUM"),
+    (["vira a direita", "direita"],                               "VIRAR_DIREITA",  "NENHUM"),
+    (["levanta"],                                                 "LEVANTAR",  "NENHUM"),
+    (["senta"],                                                   "SENTAR",    "NENHUM"),
+    (["olha para mim"],                                           "OLHAR_INTERLOCUTOR", "NENHUM"),
+    (["olha em frente", "olha para a frente"],                    "OLHAR_FRENTE", "NENHUM"),
+    (["cumprimenta", "ola"],                                      "CUMPRIMENTAR", "NENHUM"),
+    (["quem es", "apresenta-te", "como te chamas"],               "APRESENTAR",   "NENHUM"),
+    (["como estas", "estado atual"],                              "ESTADO_ATUAL", "NENHUM"),
+    (["repete", "diz outra vez"],                                 "REPETIR",      "NENHUM"),
+    (["sim", "claro", "faz isso", "ok", "pode ser",
+      "exato", "por favor", "faz favor", "confirmo"],             "CONFIRMAR",    "NENHUM"),
+    (["nao", "cancela", "esquece", "afinal nao"],                 "CANCELAR",     "NENHUM"),
+]
+
+REGRAS_TARGET = [
+    (["bola de tenis", "bola", "tenis", "boletenas"], "BOLA_DE_TENIS"),
+    (["cubo de rubik", "cubo magico", "cubo", "rubik"], "CUBO_DE_RUBIK"),
+    (["pasta de dentes", "pasta", "dentes"], "PASTA_DE_DENTES"),
+]
+
+def classificar(texto):
     t = normalizar(texto)
-    action = "DESCONHECIDA"
-    target = "NENHUM"
-
-    REGRAS_TARGET = [
-        (["bola", "tenis"], "BOLA_DE_TENIS"),
-        (["cubo", "rubik"], "CUBO_DE_RUBIK"),
-        (["pasta", "dentes"], "PASTA_DE_DENTES"),
-    ]
-
-    REGRAS = [
-        (["vai buscar", "ir buscar", "apanha"], "IR_BUSCAR", None),
-        (["traz"], "TRAZER", None),
-        (["agarra"], "AGARRAR", None),
-
-        (["anda"], "ANDAR", "NENHUM"),
-        (["para"], "PARAR", "NENHUM"),
-        (["recua"], "RECUAR", "NENHUM"),
-
-        (["sim", "ok", "claro"], "CONFIRMAR", "NENHUM"),
-        (["nao", "cancela"], "CANCELAR", "NENHUM"),
-    ]
-
+    action, target = "DESCONHECIDA", "NENHUM"
     for palavras, tgt in REGRAS_TARGET:
         if any(contem(t, p) for p in palavras):
             target = tgt
             break
-
     for palavras, act, override in REGRAS:
         if any(contem(t, p) for p in palavras):
             action = act
-            if override:
+            if override is not None:
                 target = override
             break
-
+    if action in ACOES_COM_CONFIRMACAO and target == "NENHUM":
+        target = "DESCONHECIDO"
     return {"action": action, "target": target}
 
-# ==============================================================================
-# AUDIO (VAD)
-# ==============================================================================
-def calcular_rms(pcm_bytes: bytes) -> float:
-    if len(pcm_bytes) < 2:
-        return 0.0
-    samples = struct.unpack(f"{len(pcm_bytes)//2}h", pcm_bytes)
-    return math.sqrt(sum(s*s for s in samples)/len(samples))
+SYSTEM_PROMPT = (
+    "Tu es o Johnny, um robo Unitree em Portugal. "
+    "Fala sempre em Portugues de Portugal (pt-PT). Se muito breve e simpatico. "
+    "Nunca uses mais de 2 frases."
+)
 
-def gravar() -> Optional[str]:
+def conversar(historico):
+    try:
+        r = ollama_client.chat(model=OLLAMA_MODEL, messages=historico)
+        return r["message"]["content"].strip()
+    except Exception as e:
+        return "Desculpa, tive um problema."
+
+def calcular_rms(pcm_bytes):
+    if len(pcm_bytes) < 2: return 0.0
+    samples = struct.unpack(f"{len(pcm_bytes)//2}h", pcm_bytes)
+    return math.sqrt(sum(s*s for s in samples) / len(samples))
+
+def aplicar_ganho_pcm16(pcm_bytes: bytes, ganho: float = AUDIO_GAIN) -> bytes:
+    """
+    Aplica ganho ao áudio PCM 16-bit.
+
+    Serve para aumentar ligeiramente o volume antes de enviar o áudio para o Whisper.
+    Usa clipping para evitar ultrapassar os limites de int16.
+    """
+    if not pcm_bytes or ganho == 1.0:
+        return pcm_bytes
+
+    samples = struct.unpack(f"{len(pcm_bytes) // 2}h", pcm_bytes)
+    samples_com_ganho = []
+
+    for s in samples:
+        valor = int(s * ganho)
+
+        # Limites do formato int16
+        if valor > 32767:
+            valor = 32767
+        elif valor < -32768:
+            valor = -32768
+
+        samples_com_ganho.append(valor)
+
+    return struct.pack(f"{len(samples_com_ganho)}h", *samples_com_ganho)
+
+def parse_audio_parts(parts):
+    if len(parts) == 4: return None, parts[2], parts[3]
+    if len(parts) > 4:  return None, parts[2], b"".join(parts[3:])
+    if len(parts) == 3: return None, parts[1], parts[2]
+    if len(parts) > 3:  return None, parts[1], b"".join(parts[2:])
+    return None, None, None
+
+
+def pcm_to_mono(pcm_bytes: bytes, channels: int) -> bytes:
+    """
+    Garante que o áudio está em mono PCM 16-bit.
+
+    Se já vier mono, devolve igual.
+    Se vier com mais canais, fica apenas com o primeiro canal.
+    """
+    if channels <= 1:
+        return pcm_bytes
+
+    samples = struct.unpack(f"{len(pcm_bytes) // 2}h", pcm_bytes)
+
+    mono_samples = samples[::channels]
+
+    return struct.pack(f"{len(mono_samples)}h", *mono_samples)
+
+
+def gerar_frames_webrtc(pcm_bytes: bytes, sample_rate: int, frame_ms: int = WEBRTC_FRAME_MS):
+    """
+    Divide o áudio em frames compatíveis com WebRTC VAD.
+
+    O WebRTC VAD exige frames de 10, 20 ou 30 ms.
+    """
+    bytes_por_sample = 2
+    samples_por_frame = int(sample_rate * frame_ms / 1000)
+    bytes_por_frame = samples_por_frame * bytes_por_sample
+
+    for i in range(0, len(pcm_bytes) - bytes_por_frame + 1, bytes_por_frame):
+        yield pcm_bytes[i:i + bytes_por_frame]
+
+
+def webrtc_tem_fala(vad, pcm_bytes: bytes, sample_rate: int, channels: int) -> bool:
+    """
+    Usa WebRTC VAD para decidir se um chunk contém voz.
+
+    Devolve True se a percentagem de frames com fala for suficiente.
+    """
+    if sample_rate not in (8000, 16000, 32000, 48000):
+        return False
+
+    pcm_mono = pcm_to_mono(pcm_bytes, channels)
+
+    frames = list(gerar_frames_webrtc(pcm_mono, sample_rate, WEBRTC_FRAME_MS))
+
+    if not frames:
+        return False
+
+    frames_com_fala = 0
+
+    for frame in frames:
+        try:
+            if vad.is_speech(frame, sample_rate):
+                frames_com_fala += 1
+        except Exception:
+            return False
+
+    ratio_fala = frames_com_fala / len(frames)
+
+    return ratio_fala >= WEBRTC_MIN_SPEECH_RATIO
+
+def gravar():
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(f"tcp://{G1_IP}:{PORT}")
@@ -125,91 +293,135 @@ def gravar() -> Optional[str]:
     sock.setsockopt(zmq.RCVTIMEO, ZMQ_TIMEOUT * 1000)
 
     audio_buffer = bytearray()
-    last_sr = 48000
-    last_ch = 1
 
+    # Pré-buffer: guarda áudio imediatamente anterior à deteção de voz.
+    # Isto ajuda a não perder o início da frase.
+    pre_buffer = deque()
+    pre_buffer_duration = 0.0
+
+    last_sr, last_ch = 48000, 1
     speech_started = False
-    speech_duration = 0.0
-    silence_duration = 0.0
+    speech_duration = silence_duration = 0.0
+    speech_frames = silence_frames = 0
 
-    speech_frames = 0
-    silence_frames = 0
+    vad = webrtcvad.Vad(WEBRTC_VAD_MODE)
 
     print("\n[MIC] A ouvir...")
 
-    while True:
-        try:
-            parts = sock.recv_multipart()
-        except zmq.Again:
-            if speech_started and speech_duration >= VAD_MIN_SPEECH_SECS:
-                break
-            continue
+    try:
+        while True:
+            try:
+                parts = sock.recv_multipart()
+            except zmq.Again:
+                if speech_started and speech_duration >= VAD_MIN_SPEECH_SECS:
+                    break
+                continue
 
-        if not parts or parts[0] != AUDIO_TOPIC:
-            continue
+            if not parts or parts[0] != AUDIO_TOPIC:
+                continue
 
-        # FIX ZMQ (variável)
-        header = parts[1]
-        pcm_compressed = b"".join(parts[2:])
+            _, header, pcm_compressed = parse_audio_parts(parts)
 
-        if header and len(header) >= 5:
-            last_sr = int.from_bytes(header[:4], "little")
-            last_ch = header[4]
+            if header and len(header) >= 5:
+                last_sr = int.from_bytes(header[:4], "little")
+                last_ch = header[4]
 
-        try:
-            pcm = lz4.frame.decompress(pcm_compressed)
-        except:
-            continue
+            try:
+                pcm = lz4.frame.decompress(pcm_compressed)
+            except:
+                continue
 
-        chunk_secs = (len(pcm)//2) / last_sr
-        rms = calcular_rms(pcm)
+            if not pcm:
+                continue
 
-        if rms > VAD_THRESHOLD:
-            speech_frames += 1
-            silence_frames = 0
-        else:
-            silence_frames += 1
-            speech_frames = 0
+            # Duração do chunk.
+            # Divide por last_ch para ficar correto caso o áudio venha com mais de 1 canal.
+            chunk_secs = (len(pcm) // 2) / (last_sr * max(last_ch, 1))
 
-        is_speech = speech_frames >= 3
-        is_silence = silence_frames >= 8
+            rms = calcular_rms(pcm)
 
-        if is_speech:
-            if not speech_started:
-                print("[MIC] Voz detetada")
-                speech_started = True
+            # WebRTC VAD tenta perceber se há voz humana.
+            vad_ok = webrtc_tem_fala(vad, pcm, last_sr, last_ch)
 
-            silence_duration = 0
-            speech_duration += chunk_secs
-            audio_buffer.extend(pcm)
+            # Decisão híbrida:
+            # - RMS evita processar silêncio absoluto
+            # - WebRTC VAD evita confundir ruído com fala
+            if rms > VAD_RMS_MIN and vad_ok:
+                speech_frames += 1
+                silence_frames = 0
+            else:
+                silence_frames += 1
+                speech_frames = 0
 
-        elif speech_started:
-            silence_duration += chunk_secs
-            audio_buffer.extend(pcm)
+            is_speech = speech_frames >= 3
+            is_silence = silence_frames >= 8
 
-            if is_silence and silence_duration >= VAD_SILENCE_SECS:
-                break
+            if is_speech:
+                if not speech_started:
+                    speech_started = True
+                    print("[MIC] Voz detetada")
 
-    if not audio_buffer:
-        return None
+                    # Quando a voz começa, acrescentamos o áudio guardado antes.
+                    # Isto evita perder o início da frase.
+                    for old_pcm, _ in pre_buffer:
+                        audio_buffer.extend(old_pcm)
 
-    with wave.open(AUDIO_TEMP, "wb") as wf:
-        wf.setnchannels(last_ch)
-        wf.setsampwidth(2)
-        wf.setframerate(last_sr)
-        wf.writeframes(audio_buffer)
+                    pre_buffer.clear()
+                    pre_buffer_duration = 0.0
 
-    return AUDIO_TEMP
+                silence_duration = 0.0
+                speech_duration += chunk_secs
+                audio_buffer.extend(pcm)
 
-# ==============================================================================
-# TTS
-# ==============================================================================
-def falar(texto: str):
-    async def _run():
+            elif not speech_started:
+                # Enquanto ainda não começou a fala, guardamos um pequeno histórico.
+                pre_buffer.append((pcm, chunk_secs))
+                pre_buffer_duration += chunk_secs
+
+                # Mantém apenas os últimos PRE_BUFFER_SECS segundos.
+                while pre_buffer_duration > PRE_BUFFER_SECS and pre_buffer:
+                    _, dur = pre_buffer.popleft()
+                    pre_buffer_duration -= dur
+
+            elif speech_started:
+                silence_duration += chunk_secs
+                audio_buffer.extend(pcm)
+
+                if is_silence and silence_duration >= VAD_SILENCE_SECS:
+                    if speech_duration >= VAD_MIN_SPEECH_SECS:
+                        print("[MIC] Silencio -> processar")
+                        break
+                    else:
+                        audio_buffer.clear()
+                        pre_buffer.clear()
+
+                        speech_started = False
+                        speech_duration = silence_duration = 0.0
+                        speech_frames = silence_frames = 0
+                        pre_buffer_duration = 0.0
+
+        if not audio_buffer:
+            return None
+
+        # Aplica ganho antes de guardar o ficheiro para o Whisper.
+        audio_final = aplicar_ganho_pcm16(bytes(audio_buffer), ganho=AUDIO_GAIN)
+
+        with wave.open(AUDIO_TEMP, "wb") as wf:
+            wf.setnchannels(last_ch)
+            wf.setsampwidth(2)
+            wf.setframerate(last_sr)
+            wf.writeframes(audio_final)
+
+        return AUDIO_TEMP
+
+    finally:
+        sock.close()
+        ctx.term()
+
+def falar(texto):
+    async def _g():
         await edge_tts.Communicate(texto, "pt-PT-DuarteNeural").save(AUDIO_RESP)
-
-    asyncio.run(_run())
-
+    asyncio.run(_g())
     pygame.mixer.init()
     pygame.mixer.music.load(AUDIO_RESP)
     pygame.mixer.music.play()
@@ -217,115 +429,130 @@ def falar(texto: str):
         pygame.time.Clock().tick(10)
     pygame.mixer.quit()
 
-# ==============================================================================
-# FRASES
-# ==============================================================================
+def publicar_dds(writer, texto, action, target):
+    cmd = HRICommand(source="HRI", original_text=texto, action=action, target=target,
+                     confirmed=True, timestamp=datetime.now().isoformat(timespec="seconds"))
+    writer.write(cmd)
+    print(f"[DDS] PUBLICADO -- action={action}  target={target}")
+
 NOME_TARGET = {
-    "BOLA_DE_TENIS": "a bola de ténis",
-    "CUBO_DE_RUBIK": "o cubo mágico",
-    "PASTA_DE_DENTES": "a pasta de dentes",
-    "NENHUM": "isso",
+    "BOLA_DE_TENIS": "a bola de tenis", "CUBO_DE_RUBIK": "o cubo magico",
+    "PASTA_DE_DENTES": "a pasta de dentes", "DESCONHECIDO": "o objeto", "NENHUM": "isso",
 }
 
 def frase_confirmacao(action, target):
     nome = NOME_TARGET.get(target, "o objeto")
-    return f"Queres que eu vá buscar {nome}?"
+    if action == "TRAZER":    return f"Queres que eu traga {nome}?"
+    if action == "IR_BUSCAR": return f"Queres que eu va buscar {nome}?"
+    if action == "AGARRAR":   return f"Queres que eu agarre {nome}?"
+    return f"Confirmas a acao com {nome}?"
 
 def frase_execucao(action, target):
     nome = NOME_TARGET.get(target, "o objeto")
-    return f"Ok! Vou tratar de {nome}."
+    if action == "TRAZER":    return f"Combinado! Vou ja trazer {nome}."
+    if action == "IR_BUSCAR": return f"Combinado! Vou ja buscar {nome}."
+    if action == "AGARRAR":   return f"Combinado! Vou agarrar {nome}."
+    return "Combinado, vou ja!"
 
 def frase_imediata(action):
     return {
-        "ANDAR": "Ok, a andar!",
-        "PARAR": "Ok, paro aqui.",
-        "RECUAR": "Ok, a recuar.",
+        "ANDAR": "Ok, a andar!", "PARAR": "Ok, paro aqui.", "RECUAR": "Ok, a recuar.",
+        "LEVANTAR": "Ok, a levantar!", "SENTAR": "Ok, a sentar.",
+        "VIRAR_ESQUERDA": "Ok, a virar a esquerda.", "VIRAR_DIREITA": "Ok, a virar a direita.",
+        "OLHAR_INTERLOCUTOR": "Ok, a olhar para ti.", "OLHAR_FRENTE": "Ok, a olhar em frente.",
+        "CUMPRIMENTAR": "Ola! Muito prazer!",
+        "APRESENTAR": "Ola! Sou o Johnny, um robo Unitree.",
+        "ESTADO_ATUAL": "Estou operacional!", "REPETIR": "Claro, repito!",
+        "LARGAR": "Ok, a largar!",
     }.get(action, "Ok!")
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
 def main():
-    print("Sistema pronto")
-
+    print("A carregar Whisper...")
     whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    print("Whisper pronto!")
+
+    try:
+        ollama_client.chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": "ok"}])
+        print("Ollama pronto!\n")
+    except:
+        print("ERRO: ollama serve + ollama pull qwen2.5:1.5b"); sys.exit(1)
 
     participant = DomainParticipant()
-    topic = Topic(participant, "HRICommands", HRICommand)
+    topic = Topic(participant, TOPIC_NAME, HRICommand)
     writer = DataWriter(participant, topic)
-
+    historico = [{"role": "system", "content": SYSTEM_PROMPT}]
     pending = None
-    pending_time = None
-    last_text = ""
 
-    while True:
-        ficheiro = gravar()
-        if not ficheiro:
-            continue
+    print("=" * 52)
+    print("   SISTEMA HRI -- UNITREE G1  (Ctrl+C para sair)")
+    print("=" * 52 + "\n")
 
-        segs, _ = whisper.transcribe(ficheiro, language="pt")
-        texto = "".join(s.text for s in segs).strip()
+    try:
+        while True:
+            ficheiro = gravar()
+            if not ficheiro:
+                continue
+            try:
+                # segs, _ = whisper.transcribe(ficheiro, language="pt",
+                #                              beam_size=5, best_of=5,
+                #                              temperature=0.0,
+                #                              condition_on_previous_text=False)
+                segs, _ = whisper.transcribe(
+                    ficheiro,
+                    language="pt",
+                    beam_size=5,
+                    best_of=5,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    initial_prompt=(
+                        "Comandos possíveis em português: anda, para, recua, levanta-te, senta-te, "
+                        "vira à esquerda, vira à direita, olha para mim, olha em frente, "
+                        "vai buscar a bola de ténis, traz a bola de ténis, agarra a bola de ténis, "
+                        "vai buscar o cubo de Rubik, traz o cubo de Rubik, agarra o cubo de Rubik, "
+                        "vai buscar a pasta de dentes, traz a pasta de dentes, agarra a pasta de dentes, "
+                        "sim, não, cancela, ok."
+                    )
+                )
+                texto = "".join(s.text for s in segs).strip()
+                if not texto:
+                    print("[Whisper] Nao percebi nada.")
+                    continue
 
-        if texto == last_text:
-            continue
-        last_text = texto
+                print(f"[Utilizador]: {texto}")
+                result = classificar(texto)
+                action, target = result["action"], result["target"]
+                print(f"[Classificacao]: {action} / {target}")
 
-        if not texto:
-            continue
+                if action == "CONFIRMAR" and pending:
+                    publicar_dds(writer, pending["texto"], pending["action"], pending["target"])
+                    resposta = frase_execucao(pending["action"], pending["target"])
+                    pending = None
+                elif action == "CONFIRMAR":
+                    resposta = "Nao ha nenhuma acao pendente."
+                elif action == "CANCELAR" and pending:
+                    resposta = "Ok, fico aqui entao."; pending = None
+                elif action == "CANCELAR":
+                    resposta = "Ok, sem problema."
+                elif action in ACOES_COM_CONFIRMACAO:
+                    pending = {"action": action, "target": target, "texto": texto}
+                    resposta = frase_confirmacao(action, target)
+                elif action in ACOES_IMEDIATAS:
+                    publicar_dds(writer, texto, action, target)
+                    resposta = frase_imediata(action)
+                else:
+                    historico.append({"role": "user", "content": texto})
+                    resposta = conversar(historico)
+                    historico.append({"role": "assistant", "content": resposta})
 
-        print("[USER]", texto)
+                print(f"[Johnny]: {resposta}")
+                falar(resposta)
+                time.sleep(0.4)
+            finally:
+                if os.path.exists(ficheiro):
+                    os.remove(ficheiro)
 
-        result = classificar(texto)
-        action = result["action"]
-        target = result["target"]
-
-        resposta = None
-
-        # FIX timeout seguro
-        if pending and pending_time is not None and (time.time() - pending_time > PENDING_TIMEOUT_SEC):
-            print("[PENDING] expirou")
-            pending = None
-
-        if action == "CONFIRMAR" and pending:
-            cmd = HRICommand(
-                source="HRI",
-                original_text=texto,
-                action=pending["action"],
-                target=pending["target"],
-                confirmed=True,
-                timestamp=datetime.now().isoformat()
-            )
-            writer.write(cmd)
-
-            resposta = frase_execucao(pending["action"], pending["target"])
-            pending = None
-
-        elif action == "CANCELAR":
-            pending = None
-            resposta = "Ok, cancelado."
-
-        elif action in ACOES_COM_CONFIRMACAO:
-            pending = {"action": action, "target": target}
-            pending_time = time.time()
-            resposta = frase_confirmacao(action, target)
-
-        elif action in ACOES_IMEDIATAS:
-            cmd = HRICommand(
-                source="HRI",
-                original_text=texto,
-                action=action,
-                target=target,
-                confirmed=True,
-                timestamp=datetime.now().isoformat()
-            )
-            writer.write(cmd)
-            resposta = frase_imediata(action)
-
-        else:
-            resposta = "Não percebi, podes repetir?"
-
-        print("[ROBOT]", resposta)
-        falar(resposta)
+    except KeyboardInterrupt:
+        print("\nA desligar o Johnny... Ate logo!")
 
 if __name__ == "__main__":
     main()
