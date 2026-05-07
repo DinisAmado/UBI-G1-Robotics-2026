@@ -28,7 +28,7 @@ while True:
     overlay = frame.copy()
 
     # 3. Predição
-    results = model.predict(source=frame, conf=0.9, verbose=False)
+    results = model.predict(source=frame, conf=0.1, verbose=False)
 
     for r in results:
         # --- DESENHAR SEGMENTAÇÃO COM OPACIDADE ---
