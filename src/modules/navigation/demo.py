@@ -48,6 +48,17 @@ MAP_ORIGIN_Y = -5.0
 MAP_RESOLUTION = 0.05
 
 
+# ---------------------------------------------------------------
+# Configurações da navegação local
+# ---------------------------------------------------------------
+LOCAL_GOAL_STOP_DISTANCE_M = 0.30       # parar a 30 cm do obstáculo
+LOCAL_GOAL_FRONT_ANGLE_DEG = 70         # cone frontal de procura
+LOCAL_GOAL_MIN_DISTANCE_M = 0.45        # ignora obstáculos demasiado perto
+LOCAL_GOAL_MAX_DISTANCE_M = 4.00        # procura até 4 m
+LOCAL_GOAL_SEARCH_RADIUS_M = 0.35       # se o goal cair mal, procura livre à volta
+REPLAN_INTERVAL_S = 1.0                 # em modo local, recalcula no máximo a cada 1 s
+
+
 def world_to_cell(world_x, world_y):
     cell_x = int((world_x - MAP_ORIGIN_X) / MAP_RESOLUTION)
     cell_y = int((world_y - MAP_ORIGIN_Y) / MAP_RESOLUTION)
@@ -69,50 +80,172 @@ def yaw_from_quaternion(qx, qy, qz, qw):
     return math.atan2(siny_cosp, cosy_cosp)
 
 
-def find_approach_goal(
-    slam,
-    table_cell,
-    robot_cell,
-    target_distance_m=0.30,
-    tolerance_m=0.10
-):
-    tx, ty = table_cell
+def normalize_angle(angle):
+    """
+    Normaliza ângulo para [-pi, pi].
+    """
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def is_goal_cell_usable(slam, x, y):
+    """
+    Verifica se uma célula pode ser usada como objetivo.
+
+    Para já aceitamos células livres ou desconhecidas, desde que não estejam ocupadas.
+    Isto é útil porque o mapa local pode ter zonas ainda não totalmente observadas.
+    """
+    if not (0 <= x < slam.map_size and 0 <= y < slam.map_size):
+        return False
+
+    if slam.is_occupied(x, y):
+        return False
+
+    return True
+
+
+def find_nearby_free_goal(slam, desired_goal, robot_cell, search_radius_m=0.35):
+    """
+    Se o ponto de paragem calculado não for válido, procura uma célula livre/desocupada
+    próxima desse ponto.
+
+    Escolhe a célula mais próxima do ponto desejado e, em empate, a mais próxima do robô.
+    """
+    gx, gy = desired_goal
     rx, ry = robot_cell
 
-    target_cells = int(target_distance_m / MAP_RESOLUTION)
-    tolerance_cells = int(tolerance_m / MAP_RESOLUTION)
-
-    min_dist = max(1, target_cells - tolerance_cells)
-    max_dist = target_cells + tolerance_cells
+    search_radius_cells = max(1, int(search_radius_m / MAP_RESOLUTION))
 
     candidates = []
 
-    for dx in range(-max_dist, max_dist + 1):
-        for dy in range(-max_dist, max_dist + 1):
-            gx = tx + dx
-            gy = ty + dy
+    for dx in range(-search_radius_cells, search_radius_cells + 1):
+        for dy in range(-search_radius_cells, search_radius_cells + 1):
+            cx = gx + dx
+            cy = gy + dy
 
-            if not (0 <= gx < slam.map_size and 0 <= gy < slam.map_size):
+            if not (0 <= cx < slam.map_size and 0 <= cy < slam.map_size):
                 continue
 
-            dist_to_table = math.sqrt(dx * dx + dy * dy)
-
-            if dist_to_table < min_dist or dist_to_table > max_dist:
+            if not is_goal_cell_usable(slam, cx, cy):
                 continue
 
-            if slam.is_occupied(gx, gy):
-                continue
+            dist_to_desired = math.sqrt(dx * dx + dy * dy)
+            dist_to_robot = math.sqrt((cx - rx) ** 2 + (cy - ry) ** 2)
 
-            dist_to_robot = math.sqrt((gx - rx) ** 2 + (gy - ry) ** 2)
-            score = abs(dist_to_table - target_cells) + 0.05 * dist_to_robot
-
-            candidates.append((score, gx, gy))
+            score = dist_to_desired + 0.02 * dist_to_robot
+            candidates.append((score, cx, cy))
 
     if not candidates:
         return None
 
     candidates.sort(key=lambda item: item[0])
     return candidates[0][1], candidates[0][2]
+
+
+def find_nearest_front_obstacle_goal(
+    slam,
+    robot_cell,
+    robot_yaw,
+    stop_distance_m=0.30,
+    front_angle_deg=70,
+    min_distance_m=0.45,
+    max_distance_m=4.00,
+    search_radius_m=0.35
+):
+    """
+    Encontra automaticamente um objetivo local perto do obstáculo frontal mais próximo.
+
+    Lógica:
+    1. procura células ocupadas na occupancy grid;
+    2. filtra apenas obstáculos à frente do robô, dentro de um cone frontal;
+    3. escolhe o obstáculo mais próximo;
+    4. cria um objetivo 30 cm antes desse obstáculo;
+    5. se o objetivo não for utilizável, procura uma célula livre próxima.
+
+    Isto serve para o cenário:
+        robô -> mesa -> pessoas
+
+    Como a mesa é o obstáculo frontal mais próximo, o robô escolhe parar antes dela.
+    """
+    rx, ry = robot_cell
+
+    min_cells = int(min_distance_m / MAP_RESOLUTION)
+    max_cells = int(max_distance_m / MAP_RESOLUTION)
+    stop_cells = max(1, int(stop_distance_m / MAP_RESOLUTION))
+
+    half_angle_rad = math.radians(front_angle_deg / 2.0)
+
+    # Direção "frente" no referencial da grelha.
+    # No teu código, x da grelha corresponde ao eixo vertical e y ao horizontal.
+    forward_x = math.cos(robot_yaw)
+    forward_y = math.sin(robot_yaw)
+
+    best_obstacle = None
+    best_dist = float("inf")
+
+    x_min = max(0, rx - max_cells)
+    x_max = min(slam.map_size - 1, rx + max_cells)
+    y_min = max(0, ry - max_cells)
+    y_max = min(slam.map_size - 1, ry + max_cells)
+
+    for x in range(x_min, x_max + 1):
+        for y in range(y_min, y_max + 1):
+
+            if not slam.is_occupied(x, y):
+                continue
+
+            vx = x - rx
+            vy = y - ry
+
+            dist = math.sqrt(vx * vx + vy * vy)
+
+            if dist < min_cells or dist > max_cells:
+                continue
+
+            # Ângulo entre a direção do robô e a direção para o obstáculo
+            dot = (vx * forward_x + vy * forward_y) / dist
+            dot = max(-1.0, min(1.0, dot))
+            angle_to_forward = math.acos(dot)
+
+            if angle_to_forward > half_angle_rad:
+                continue
+
+            if dist < best_dist:
+                best_dist = dist
+                best_obstacle = (x, y)
+
+    if best_obstacle is None:
+        return None, None
+
+    ox, oy = best_obstacle
+
+    # Vetor unitário do robô para o obstáculo
+    vx = ox - rx
+    vy = oy - ry
+    dist = math.sqrt(vx * vx + vy * vy)
+
+    if dist <= stop_cells:
+        return None, best_obstacle
+
+    ux = vx / dist
+    uy = vy / dist
+
+    # Ponto de paragem: 30 cm antes do obstáculo
+    desired_gx = int(round(ox - ux * stop_cells))
+    desired_gy = int(round(oy - uy * stop_cells))
+
+    desired_goal = (desired_gx, desired_gy)
+
+    if is_goal_cell_usable(slam, desired_gx, desired_gy):
+        return desired_goal, best_obstacle
+
+    nearby_goal = find_nearby_free_goal(
+        slam=slam,
+        desired_goal=desired_goal,
+        robot_cell=robot_cell,
+        search_radius_m=search_radius_m
+    )
+
+    return nearby_goal, best_obstacle
 
 
 class RobotController:
@@ -173,7 +306,6 @@ class RobotController:
             max_range=100
         )
 
-
         lidar = None
 
         if real_robot:
@@ -184,22 +316,16 @@ class RobotController:
             )
             print("Livox iniciado.")
 
-
         output_dir = "outputs"
         os.makedirs(output_dir, exist_ok=True)
 
         # ---------------------------------------------------
-        # Objetivo inicial
-        # No robô real começa sem objetivo conhecido.
-        # A perceção/interação deverá preencher isto depois.
+        # Objetivo local automático
         # ---------------------------------------------------
-        # Objetivo temporário só para testar A*
-        test_goal_world = (1.5, 0.0)
-        current_goal_cell = world_to_cell(test_goal_world[0], test_goal_world[1])
-        
-        table_world = None
-        table_cell = None
+        current_goal_cell = None
+        current_obstacle_cell = None
         current_path = []
+        last_replan_time = 0.0
 
         # Posição inicial
         init_cell_x, init_cell_y = world_to_cell(self.pos_x, self.pos_y)
@@ -224,6 +350,7 @@ class RobotController:
         leg_obs = mpatches.Patch(color='black', label='Obstáculo')
 
         robot_dot, = ax.plot([], [], "ro", markersize=8, label="Robô G1")
+
         robot_arrow = ax.quiver(
             [0], [0], [0], [0],
             angles='xy',
@@ -232,12 +359,14 @@ class RobotController:
             color='red',
             width=0.004
         )
-        path_line, = ax.plot([], [], "g-", linewidth=2, label="Caminho A*")
-        goal_dot, = ax.plot([], [], "bo", markersize=6, label="Objetivo")
 
-        ax.set_title("SLAM e Navegação")
+        path_line, = ax.plot([], [], "g-", linewidth=2, label="Caminho A*")
+        goal_dot, = ax.plot([], [], "bo", markersize=7, label="Objetivo")
+        obstacle_dot, = ax.plot([], [], "mo", markersize=5, label="Obstáculo alvo")
+
+        ax.set_title("SLAM e Navegação — objetivo automático no obstáculo frontal")
         ax.legend(
-            handles=[leg_free, leg_unk, leg_obs, path_line, robot_dot, goal_dot],
+            handles=[leg_free, leg_unk, leg_obs, path_line, robot_dot, goal_dot, obstacle_dot],
             loc='upper right',
             fontsize='small'
         )
@@ -250,9 +379,9 @@ class RobotController:
         last_saved_path = None
         MAP_SAVE_INTERVAL = 2.0
 
-
         last_odom_debug_time = 0.0
         printed_odom_structure = False
+        last_goal_debug_time = 0.0
 
         while True:
             step_start = time.perf_counter()
@@ -367,26 +496,58 @@ class RobotController:
             if viz_counter >= 20:
                 viz_counter = 0
 
-                path_needs_replan = not current_path or not slam.is_path_valid(current_path)
+                now = time.time()
+
+                # Recalcular objetivo/caminho se:
+                # - ainda não há caminho;
+                # - o caminho ficou inválido;
+                # - passou algum tempo desde o último replaneamento.
+                #
+                # Em modo local, isto ajuda porque o mapa muda muito com o LiDAR.
+                path_needs_replan = (
+                    not current_path
+                    or not slam.is_path_valid(current_path)
+                    or (now - last_replan_time >= REPLAN_INTERVAL_S)
+                )
 
                 if path_needs_replan:
+                    current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
+                        slam=slam,
+                        robot_cell=(curr_cell_x, curr_cell_y),
+                        robot_yaw=yaw,
+                        stop_distance_m=LOCAL_GOAL_STOP_DISTANCE_M,
+                        front_angle_deg=LOCAL_GOAL_FRONT_ANGLE_DEG,
+                        min_distance_m=LOCAL_GOAL_MIN_DISTANCE_M,
+                        max_distance_m=LOCAL_GOAL_MAX_DISTANCE_M,
+                        search_radius_m=LOCAL_GOAL_SEARCH_RADIUS_M
+                    )
 
-                    if table_cell is not None:
-                        current_goal_cell = find_approach_goal(
-                            slam=slam,
-                            table_cell=table_cell,
-                            robot_cell=(curr_cell_x, curr_cell_y),
-                            target_distance_m=0.30,
-                            tolerance_m=0.10
-                        )
+                    last_replan_time = now
 
-                        if current_goal_cell is not None:
-                            current_path = slam.plan_path(current_goal_cell)
-                        else:
-                            current_path = []
+                    if current_goal_cell is not None:
+                        current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
 
+                        if not current_path:
+                            current_goal_cell = None
                     else:
-                        current_path = slam.plan_path(current_goal_cell)
+                        current_path = []
+
+                # Debug do objetivo automático
+                if now - last_goal_debug_time >= 1.5:
+                    last_goal_debug_time = now
+
+                    if current_goal_cell is not None and current_obstacle_cell is not None:
+                        gx, gy = current_goal_cell
+                        ox, oy = current_obstacle_cell
+                        dist_obs_m = math.sqrt((ox - curr_cell_x) ** 2 + (oy - curr_cell_y) ** 2) * MAP_RESOLUTION
+                        dist_goal_m = math.sqrt((gx - curr_cell_x) ** 2 + (gy - curr_cell_y) ** 2) * MAP_RESOLUTION
+
+                        print(
+                            f"OBJETIVO AUTO | obstáculo=({ox},{oy}) dist={dist_obs_m:.2f} m | "
+                            f"goal=({gx},{gy}) dist={dist_goal_m:.2f} m | path={len(current_path)}"
+                        )
+                    else:
+                        print("OBJETIVO AUTO | nenhum obstáculo frontal válido encontrado")
 
                 img.set_data(slam.get_visualization_grid())
 
@@ -413,14 +574,17 @@ class RobotController:
                 else:
                     goal_dot.set_data([], [])
 
+                if current_obstacle_cell is not None:
+                    obstacle_dot.set_data([current_obstacle_cell[1]], [current_obstacle_cell[0]])
+                else:
+                    obstacle_dot.set_data([], [])
+
                 ax.set_xlim(curr_cell_y - 100, curr_cell_y + 100)
                 ax.set_ylim(curr_cell_x - 100, curr_cell_x + 100)
 
                 fig.canvas.draw()
                 fig.canvas.flush_events()
                 plt.pause(0.001)
-
-                now = time.time()
 
                 if now - last_map_save_time >= MAP_SAVE_INTERVAL:
                     np.save(
@@ -447,6 +611,10 @@ class RobotController:
                         "goal_world": {
                             "x": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[0]),
                             "y": float(cell_to_world(current_goal_cell[0], current_goal_cell[1])[1])
+                        },
+                        "obstacle_cell": None if current_obstacle_cell is None else {
+                            "x": int(current_obstacle_cell[0]),
+                            "y": int(current_obstacle_cell[1])
                         },
                         "path": [
                             {
@@ -481,4 +649,3 @@ class RobotController:
 
 if __name__ == '__main__':
     RobotController().run()
-
