@@ -193,9 +193,12 @@ class RobotController:
         # No robô real começa sem objetivo conhecido.
         # A perceção/interação deverá preencher isto depois.
         # ---------------------------------------------------
+        # Objetivo temporário só para testar A*
+        test_goal_world = (1.5, 0.0)
+        current_goal_cell = world_to_cell(test_goal_world[0], test_goal_world[1])
+        
         table_world = None
         table_cell = None
-        current_goal_cell = None
         current_path = []
 
         # Posição inicial
@@ -383,8 +386,7 @@ class RobotController:
                             current_path = []
 
                     else:
-                        current_goal_cell = None
-                        current_path = []
+                        current_path = slam.plan_path(current_goal_cell)
 
                 img.set_data(slam.get_visualization_grid())
 
