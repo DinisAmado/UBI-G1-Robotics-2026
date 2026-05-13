@@ -1,7 +1,67 @@
+# =========================
+# CORE AUDIO / ML
+# =========================
+
 faster-whisper
-SpeechRecognition
-pyaudio
-pygame
+# pip install faster-whisper
+
+webrtcvad
+# pip install webrtcvad
+
+numpy
+# pip install numpy
+
+
+# =========================
+# AUDIO / TTS / PLAYBACK
+# =========================
+
 edge-tts
+# pip install edge-tts
+
+pygame
+# pip install pygame
+
+
+# =========================
+# COMMUNICATION (STREAM AUDIO)
+# =========================
+
+pyzmq
+# pip install pyzmq
+
+lz4
+# pip install lz4
+
+
+# =========================
+# DDS (UNITREE / ROS-LIKE MIDDLEWARE)
+# =========================
+
 cyclonedds
+# pip install cyclonedds
+
+
+# =========================
+# UNITREE SDK
+# =========================
+
+unitree-sdk2py
+# pip install unitree-sdk2py
+# (se falhar: pip install unitree_sdk2py)
+
+
+# =========================
+# LLM LOCAL
+# =========================
+
 ollama
+# pip install ollama
+
+
+# =========================
+# SYSTEM / UTILITIES
+# =========================
+
+dataclasses; python_version < "3.7"
+# já incluído no Python < 3.7 (não precisa instalar)
