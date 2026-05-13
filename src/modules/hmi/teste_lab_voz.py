@@ -41,7 +41,7 @@ ZMQ_TIMEOUT    = 5
 # ou ruídos muito fracos.
 # Se o robô não detetar bem a fala, baixa este valor.
 # Se o robô apanhar demasiado ruído de fundo, aumenta este valor.
-VAD_RMS_MIN = 800
+VAD_RMS_MIN = 1200
 
 
 # Grau de agressividade do WebRTC VAD.
@@ -87,7 +87,7 @@ VAD_SILENCE_SECS = 1.2
 #
 # Se o valor for muito baixo, pode aceitar ruídos como comandos.
 # Se for muito alto, pode ignorar comandos curtos como "para" ou "sim".
-VAD_MIN_SPEECH_SECS = 0.3
+VAD_MIN_SPEECH_SECS = 0.4
 
 
 # Tempo de áudio guardado antes de o sistema detetar oficialmente a voz.
