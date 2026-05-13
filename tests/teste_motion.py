@@ -11,7 +11,7 @@ from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
 from cyclonedds.pub import Publisher, DataWriter
 from idl_ri import (
-    Header, OrchestratorState, Phase, CmdVel, ModuleStates
+    Header, OrchestratorState, Phase, CmdVel, ActiveModules
 )
 from qos_profiles import QOS_ORCHESTRATION, QOS_MOTION
 
@@ -33,11 +33,21 @@ class MotionTester:
         return Header(timestamp_ns=time.time_ns(), frame_id="test_trigger", seq=self._seq)
 
     def activate_motion(self, active=True):
-        """Simula o Orquestrador ativando o bit de motion."""
+        """
+        Simula o Orquestrador ativando o bit de motion.
+        Nota: Usamos Phase.IDLE porque OPERATIONAL não existe no teu IDL.
+        O teu main_motion.py apenas valida se 'motion' é True em active_modules.
+        """
         state = OrchestratorState(
             header=self._header(),
-            phase=Phase.OPERATIONAL,
-            active_modules=ModuleStates(motion=active, vision=False, grasping=False, hmi=False)
+            phase=Phase.IDLE, # Alterado de OPERATIONAL para IDLE (que existe no IDL)
+            active_modules=ActiveModules(
+                motion=active, 
+                vision_objects=False, 
+                vision_persons=False, 
+                navigation=False, 
+                grasping=False
+            )
         )
         self._w_state.write(state)
         status = "ATIVADO" if active else "DESATIVADO"
@@ -45,13 +55,14 @@ class MotionTester:
 
     def send_velocity(self, vx, vy, wz, duration):
         """Envia uma velocidade constante durante um tempo determinado."""
-        log.info(f"Enviando Vx={vx}, Vy={vy}, Wz={wz} por {duration}s")
+        log.info(f"Enviando Vx={vx:.2f}, Vy={vy:.2f}, Wz={wz:.2f} por {duration}s")
         end_time = time.time() + duration
         
         while time.time() < end_time:
+            # Importante: No teu IDL, CmdVel tem um Header.
             msg = CmdVel(header=self._header(), vx=vx, vy=vy, wz=wz)
             self._w_cmd_vel.write(msg)
-            time.sleep(0.02) # 50Hz para bater com o teu QOS_MOTION
+            time.sleep(0.02) # 50Hz (20ms)
 
         # Forçar paragem após o movimento
         self._w_cmd_vel.write(CmdVel(header=self._header(), vx=0.0, vy=0.0, wz=0.0))
@@ -60,7 +71,7 @@ class MotionTester:
         try:
             log.info("Iniciando sequência de teste de movimento...")
             
-            # 1. Ativar o módulo
+            # 1. Ativar o módulo (Envia o bit que o teu main_motion.py espera)
             self.activate_motion(True)
             time.sleep(1)
 
@@ -68,19 +79,21 @@ class MotionTester:
             log.info("--- Teste: Frente ---")
             self.send_velocity(0.2, 0.0, 0.0, 5.0)
             
-            time.sleep(1) # Pausa entre movimentos
+            time.sleep(1) # Pausa para estabilização
 
-            # 3. Teste de rotação (Rodar sobre o próprio eixo)
-            log.info("--- Teste: Rotação (Wz) ---")
-            self.send_velocity(0.0, 0.0, 0.5, 3.0)
+            # 3. Teste de rotação (Sentido anti-horário)
+            log.info("--- Teste: Rotação ---")
+            self.send_velocity(0.0, 0.0, 0.4, 3.0)
 
-            # 4. Parar tudo
-            log.info("Teste concluído. Desativando módulo.")
+            # 4. Parar e Desativar
+            log.info("Teste concluído. Parando robô e desativando módulo.")
+            self.send_velocity(0.0, 0.0, 0.0, 0.5)
             self.activate_motion(False)
 
         except KeyboardInterrupt:
+            log.warning("Interrupção manual! Enviando comando de paragem...")
             self._w_cmd_vel.write(CmdVel(header=self._header(), vx=0.0, vy=0.0, wz=0.0))
-            log.info("Interrompido. Robô travado.")
+            self.activate_motion(False)
 
 if __name__ == "__main__":
     tester = MotionTester()
