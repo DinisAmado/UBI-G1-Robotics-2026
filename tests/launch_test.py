@@ -22,7 +22,7 @@ BOLD  = "\033[1m"
 SCRIPTS = [
     {"nome": "Orquestrador", "path": "tests/main_test.py",                  "cor": "\033[96m"},
     {"nome": "Movimentação", "path": "tests/main_motion.py","cor": "\033[91m"},
-    {"nome": "NavSim",       "path": "tests/nav_sim.py",                    "cor": "\033[93m"},
+    {"nome": "NavSim",       "path": "tests/teste_motion.py",                    "cor": "\033[93m"},
 ]
 
 processos = []
