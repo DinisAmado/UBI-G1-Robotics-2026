@@ -213,6 +213,7 @@ def ler_wav_mono16k(path):
         return wf.readframes(wf.getnframes())
 
 def falar(texto, audio_client):
+
     async def _g():
         await edge_tts.Communicate(
             texto,
@@ -222,7 +223,8 @@ def falar(texto, audio_client):
     asyncio.run(_g())
 
     subprocess.run([
-        "ffmpeg", "-y", "-i", AUDIO_RESP,
+        "ffmpeg", "-y",
+        "-i", AUDIO_RESP,
         "-ar", "16000",
         "-ac", "1",
         "-sample_fmt", "s16",
@@ -234,6 +236,7 @@ def falar(texto, audio_client):
         pcm_bytes = ler_wav_mono16k(AUDIO_MONO)
 
         CHUNK = 3200
+
         chunks = [
             pcm_bytes[i:i+CHUNK]
             for i in range(0, len(pcm_bytes), CHUNK)
@@ -241,24 +244,38 @@ def falar(texto, audio_client):
 
         audio_client.SetVolume(100)
 
+        print("[TTS] StartPlay")
+        audio_client.StartPlay()
+
         for chunk in chunks:
+
             audio_client.PlayStream(
                 "hri_response",
                 16000,
                 chunk
             )
 
-        audio_client.PlayStop("hri_response")
+            time.sleep(0.1)
+
+        print("[TTS] StopPlay")
+        audio_client.StopPlay()
 
         print("[TTS] Audio reproduzido")
 
     except Exception as e:
         print(f"[ERRO AudioClient] {e}")
 
-    for f in [AUDIO_RESP, AUDIO_MONO]:
-        if os.path.exists(f):
-            os.remove(f)
+    finally:
 
+        try:
+            audio_client.StopPlay()
+        except:
+            pass
+
+        for f in [AUDIO_RESP, AUDIO_MONO]:
+            if os.path.exists(f):
+                os.remove(f)
+                
 def publicar_dds(writer, texto, action, target):
     cmd = HRICommand(source="HRI", original_text=texto, action=action, target=target,
                      confirmed=True, timestamp=datetime.now().isoformat(timespec="seconds"))
