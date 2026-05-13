@@ -113,7 +113,7 @@ AUDIO_GAIN = 1.6
 
 # Tempo máximo que o robô pode ficar a gravar uma frase.
 # Isto impede que o sistema fique preso em "Voz detetada" para sempre.
-MAX_RECORDING_SECS = 7.0
+MAX_RECORDING_SECS = 5.0
 
 
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
