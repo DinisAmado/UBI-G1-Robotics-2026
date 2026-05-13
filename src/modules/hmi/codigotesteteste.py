@@ -626,6 +626,7 @@ def falar(texto, audio_client):
 
     asyncio.run(_g())
 
+    # Converter MP3 -> WAV PCM mono 16kHz
     subprocess.run([
 
         "ffmpeg",
@@ -649,6 +650,7 @@ def falar(texto, audio_client):
 
         pcm_bytes = ler_wav_mono16k(AUDIO_MONO)
 
+        # 100 ms chunks
         CHUNK = 3200
 
         chunks = [
@@ -664,11 +666,6 @@ def falar(texto, audio_client):
 
         audio_client.SetVolume(100)
 
-        try:
-            audio_client.StartPlay()
-        except:
-            pass
-
         print("[TTS] A reproduzir...")
 
         for chunk in chunks:
@@ -676,8 +673,8 @@ def falar(texto, audio_client):
             try:
 
                 audio_client.PlayStream(
-                    "hri_response",
-                    16000,
+                    "hri_app",
+                    "stream_001",
                     chunk
                 )
 
@@ -687,12 +684,16 @@ def falar(texto, audio_client):
 
                 break
 
+            # IMPORTANTÍSSIMO
             time.sleep(0.1)
 
         try:
-            audio_client.StopPlay()
-        except:
-            pass
+
+            audio_client.PlayStop("hri_app")
+
+        except Exception as e:
+
+            print(f"[ERRO STOP] {e}")
 
         print("[TTS] Concluido")
 
@@ -705,7 +706,9 @@ def falar(texto, audio_client):
         for f in [AUDIO_RESP, AUDIO_MONO]:
 
             if os.path.exists(f):
+
                 os.remove(f)
+
 
 
 # =========================================================
