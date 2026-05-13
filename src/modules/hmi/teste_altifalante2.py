@@ -213,33 +213,48 @@ def ler_wav_mono16k(path):
         return wf.readframes(wf.getnframes())
 
 def falar(texto, audio_client):
-    # 1. Gerar MP3 com Edge TTS
     async def _g():
-        await edge_tts.Communicate(texto, "pt-PT-DuarteNeural").save(AUDIO_RESP)
+        await edge_tts.Communicate(
+            texto,
+            "pt-PT-DuarteNeural"
+        ).save(AUDIO_RESP)
+
     asyncio.run(_g())
 
-    # 2. Converter MP3 -> WAV 16kHz mono com ffmpeg
     subprocess.run([
         "ffmpeg", "-y", "-i", AUDIO_RESP,
-        "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
+        "-ar", "16000",
+        "-ac", "1",
+        "-sample_fmt", "s16",
         AUDIO_MONO
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    ], stdout=subprocess.DEVNULL,
+       stderr=subprocess.DEVNULL)
 
-    # 3. Tocar nos altifalantes do robô (sem depender de wav.py)
     try:
         pcm_bytes = ler_wav_mono16k(AUDIO_MONO)
-        # O AudioClient espera uma lista de bytes chunks de 3200 bytes (100ms a 16kHz)
+
         CHUNK = 3200
-        chunks = [pcm_bytes[i:i+CHUNK] for i in range(0, len(pcm_bytes), CHUNK)]
+        chunks = [
+            pcm_bytes[i:i+CHUNK]
+            for i in range(0, len(pcm_bytes), CHUNK)
+        ]
+
         audio_client.SetVolume(100)
+
         for chunk in chunks:
-            audio_client.PlayStream("hri_response", chunk)
+            audio_client.PlayStream(
+                "hri_response",
+                16000,
+                chunk
+            )
+
         audio_client.PlayStop("hri_response")
-        print("[TTS] Audio reproduzido nos altifalantes do robo")
+
+        print("[TTS] Audio reproduzido")
+
     except Exception as e:
         print(f"[ERRO AudioClient] {e}")
 
-    # 4. Limpar
     for f in [AUDIO_RESP, AUDIO_MONO]:
         if os.path.exists(f):
             os.remove(f)
