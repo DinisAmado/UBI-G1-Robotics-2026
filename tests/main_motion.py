@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MOTI
 log = logging.getLogger("motion")
 
 class MotionModule:
-    def __init__(self, network_interface="eth0"):   # alterar para a placa de rede correta
+    def __init__(self, network_interface="enp117s0"):   # alterar para a placa de rede correta
         self.is_active = False  
         self.seq = 0
         
@@ -79,6 +79,7 @@ class MotionModule:
         if samples:
             estado_geral = samples[0]
             nova_atividade = estado_geral.active_modules.motion
+            log.info(f"[DEBUG] OrchestratorState recebido: fase={estado_geral.phase.name}, motion={nova_atividade}")
             
             if nova_atividade != self.is_active:
                 self.is_active = nova_atividade # Se self.is_active for True, o módulo está ativo e a escutar comandos. Se False, está em pausa.
@@ -92,7 +93,8 @@ class MotionModule:
         if self.is_active:
             samples = self.r_cmd_vel.take(1)
             if samples:
-                cmd = samples[0]
+                cmd = samples[-1]
+                log.info(f"[DEBUG] CmdVel recebido: vx={cmd.vx} vy={cmd.vy} wz={cmd.wz}") 
                 vx, vy, wz = cmd.vx, cmd.vy, cmd.wz
         
         # Envia a velocidade para os motores (Move() atua como o joystick analógico)
@@ -178,4 +180,4 @@ class MotionModule:
 
 if __name__ == "__main__":
     # Confirma o nome da placa de rede ligada ao robô.
-    MotionModule(network_interface="eth0").run()
+    MotionModule(network_interface="enp117s0").run()
