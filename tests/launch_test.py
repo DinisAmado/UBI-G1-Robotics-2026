@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-launch_test.py — Lança o teste isolado: Orquestrador + Movimentação + NavSim.
+launch_test.py — Lança o teste isolado: Orquestrador + Movimentação + TesteMotion.
 
 Uso:
   python tests/launch_test.py
@@ -22,7 +22,7 @@ BOLD  = "\033[1m"
 SCRIPTS = [
     {"nome": "Orquestrador", "path": "tests/main_test.py",                  "cor": "\033[96m"},
     {"nome": "Movimentação", "path": "tests/main_motion.py","cor": "\033[91m"},
-    {"nome": "NavSim",       "path": "tests/teste_motion.py",                    "cor": "\033[93m"},
+    {"nome": "TesteMotion",       "path": "tests/teste_motion.py",                    "cor": "\033[93m"},
 ]
 
 processos = []
@@ -61,7 +61,7 @@ def shutdown(sig=None, frame=None):
 signal.signal(signal.SIGINT,  shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
-print(f"\n{BOLD}=== Teste Orquestrador + Movimentação + NavSim ==={RESET}\n")
+print(f"\n{BOLD}=== Teste Orquestrador + Movimentação + TesteMotion ==={RESET}\n")
 
 for s in SCRIPTS:
     if not os.path.exists(s["path"]):
@@ -76,7 +76,7 @@ for s in SCRIPTS:
     processos.append(proc)
     threading.Thread(target=stream, args=(proc, s["nome"], s["cor"]), daemon=True).start()
     print(f"{s['cor']}[{s['nome']}]{RESET} a correr (PID {proc.pid})")
-    time.sleep(0.5)   # pequeno delay para o orquestrador arrancar antes do nav_sim
+    time.sleep(0.5)   # pequeno delay para o orquestrador arrancar antes do testemotion
 
 print(f"\n{BOLD}Ctrl+C para terminar tudo.{RESET}\n")
 
