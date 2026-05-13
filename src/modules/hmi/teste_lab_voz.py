@@ -51,7 +51,7 @@ VAD_RMS_MIN = 1200
 # 1 = ligeiramente mais seletivo.
 # 2 = equilibrado; boa opção inicial.
 # 3 = muito agressivo: corta mais ruído, mas pode falhar fala baixa ou distante.
-WEBRTC_VAD_MODE = 2
+WEBRTC_VAD_MODE = 3
 
 
 # Tamanho de cada frame enviada para o WebRTC VAD, em milissegundos.
@@ -71,7 +71,7 @@ WEBRTC_FRAME_MS = 30
 #
 # Valor mais baixo = mais permissivo.
 # Valor mais alto = mais exigente.
-WEBRTC_MIN_SPEECH_RATIO = 0.5
+WEBRTC_MIN_SPEECH_RATIO = 0.6
 
 
 # Tempo de silêncio, em segundos, necessário para considerar que o utilizador
@@ -100,6 +100,10 @@ PRE_BUFFER_SECS = 0.5
 # 1.5 = aumento moderado
 # 2.0 = aumento forte, mas pode distorcer
 AUDIO_GAIN = 1.6
+
+# Tempo máximo que o robô pode ficar a gravar uma frase.
+# Isto impede que o sistema fique preso em "Voz detetada" para sempre.
+MAX_RECORDING_SECS = 7.0
 
 
 ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
@@ -301,8 +305,14 @@ def gravar():
 
     last_sr, last_ch = 48000, 1
     speech_started = False
-    speech_duration = silence_duration = 0.0
-    speech_frames = silence_frames = 0
+    speech_duration = 0.0
+    silence_duration = 0.0
+    speech_frames = 0
+    silence_frames = 0
+
+    # Conta o tempo total desde que a voz foi detetada.
+    # Serve como segurança caso o VAD nunca encontre silêncio.
+    recording_duration = 0.0
 
     vad = webrtcvad.Vad(WEBRTC_VAD_MODE)
 
@@ -314,6 +324,7 @@ def gravar():
                 parts = sock.recv_multipart()
             except zmq.Again:
                 if speech_started and speech_duration >= VAD_MIN_SPEECH_SECS:
+                    print("[MIC] Timeout ZMQ após fala -> processar")
                     break
                 continue
 
@@ -371,6 +382,7 @@ def gravar():
 
                 silence_duration = 0.0
                 speech_duration += chunk_secs
+                recording_duration += chunk_secs
                 audio_buffer.extend(pcm)
 
             elif not speech_started:
@@ -383,22 +395,34 @@ def gravar():
                     _, dur = pre_buffer.popleft()
                     pre_buffer_duration -= dur
 
-            elif speech_started:
+            else:
+                # Já começou fala, mas agora este chunk foi considerado silêncio.
                 silence_duration += chunk_secs
+                recording_duration += chunk_secs
                 audio_buffer.extend(pcm)
 
                 if is_silence and silence_duration >= VAD_SILENCE_SECS:
                     if speech_duration >= VAD_MIN_SPEECH_SECS:
-                        print("[MIC] Silencio -> processar")
+                        print("[MIC] Silêncio -> processar")
                         break
                     else:
+                        # Fala demasiado curta: provavelmente ruído.
                         audio_buffer.clear()
                         pre_buffer.clear()
 
                         speech_started = False
-                        speech_duration = silence_duration = 0.0
-                        speech_frames = silence_frames = 0
+                        speech_duration = 0.0
+                        silence_duration = 0.0
+                        speech_frames = 0
+                        silence_frames = 0
                         pre_buffer_duration = 0.0
+                        recording_duration = 0.0
+
+            # Segurança: se depois de detetar voz o sistema nunca encontrar silêncio,
+            # processa na mesma após alguns segundos.
+            if speech_started and recording_duration >= MAX_RECORDING_SECS:
+                print("[MIC] Tempo máximo de gravação atingido -> processar")
+                break
 
         if not audio_buffer:
             return None
