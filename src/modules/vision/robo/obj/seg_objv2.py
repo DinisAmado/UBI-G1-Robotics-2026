@@ -1,3 +1,25 @@
+"""
+G1 ZMQ + YOLO 6-DOF Pose Estimator — v3
+────────────────────────────────────────
+Melhorias face à v1:
+  [v2] Pose em radianos (x, y, z, roll, pitch, yaw)
+  [v2] Profundidade robusta: mediana de patch 5×5 (evita pixels inválidos)
+  [v2] Normal estabilizada com SVD sobre 5 pontos (em vez de 3 fixos)
+  [v2] Correção de indentação: overlay aplicado uma vez por resultado
+  [v2] Race condition corrigida: _run_inference recebe frame.copy()
+  [v2] Confiança configurável por classe (pasta a 0.60)
+  [v2] Logger estruturado em vez de print() raw
+
+  [v3] Profundidade via mediana da máscara completa (não só centroide)
+       → resolve falhas em superfícies brilhantes/transparentes (pasta)
+  [v3] Fallback de profundidade: tenta percentil-25 da máscara se mediana falhar
+  [v3] Filtro exponencial de pose por objeto (suaviza jitter entre frames)
+  [v3] Normal calculada sobre pontos amostrados na própria máscara (≤ 50 pts)
+       → muito mais robusto para objetos pequenos como a pasta de dentes
+  [v3] Depth frame copiado atomicamente junto com rgb (sem desalinhamento)
+  [v3] Eixo de Yaw corrigido: normalizado para [-π/2, π/2] consistentemente
+"""
+
 import cv2
 import math
 import logging
@@ -32,16 +54,18 @@ CX, CY = 320.0, 240.0
 
 # Confiança mínima por classe (mais baixa para objetos pequenos/transparentes)
 CLASS_CONF: dict[str, float] = {
-    "pasta":        0.85,   # pasta de dentes — superfície brilhante/transparente
-    "bola":         0.90,
-    "cubo":         0.90,
+    "pasta":        0.55,   # pasta de dentes — superfície brilhante/transparente
+    "pasta_dentes": 0.55,   # alias possível no modelo
+    "bola":         0.75,
+    "cubo":         0.75,
 }
-DEFAULT_CONF = 0.90
+DEFAULT_CONF = 0.90         # fallback para classes não listadas
 
 # Cores BGR por classe
 CUSTOM_COLORS: dict[str, tuple] = {
     "bola":         (0,   255, 0),
     "pasta":        (128, 0,   128),
+    "pasta_dentes": (128, 0,   128),
     "cubo":         (0,   0,   255),
 }
 
@@ -370,6 +394,7 @@ def _run_inference(
     depth_raw: np.ndarray,
     frame_viz: np.ndarray,
     model:     YOLO,
+    ema_alpha: float = EMA_ALPHA,
 ) -> np.ndarray:
     """
     Executa YOLO, calcula pose 6-DOF, aplica filtro EMA e anota o frame.
@@ -413,7 +438,7 @@ def _run_inference(
 
                 # Filtro EMA por label (suaviza jitter entre frames)
                 if label not in _pose_filters:
-                    _pose_filters[label] = PoseFilter()
+                    _pose_filters[label] = PoseFilter(alpha=ema_alpha)
                 pose = _pose_filters[label].update(raw_pose)
 
                 log.info(
@@ -488,10 +513,7 @@ def main() -> None:
     log.info(f"A carregar modelo: {args.model_path}")
     model = YOLO(args.model_path)
 
-    # Atualizar alpha do filtro EMA se passado via CLI
-    global EMA_ALPHA
-    EMA_ALPHA = args.ema_alpha
-
+    ema_alpha  = args.ema_alpha
     stop_event = threading.Event()
     rx_thread  = threading.Thread(
         target=_rx_realsense,
@@ -526,6 +548,7 @@ def main() -> None:
                 depth_raw = depth_raw_copy,
                 frame_viz = frame_viz_copy,
                 model     = model,
+                ema_alpha = ema_alpha,
             )
 
             cv2.imshow(WINDOW_NAME, frame_out)
