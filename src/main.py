@@ -16,7 +16,7 @@ from qos_profiles import (
 )
 
 from idl_ri import (
-    Header, Status, Image,
+    Header, Status, Pose6DOF,
     Intent, Acao, Feedback, OrchestrationState as HmiState,
     OrchestratorState, ActiveModules, Phase, Heartbeat,
     NavGoal as Goal, GoalType, GoalData, NavStatusMsg as NavStatus,
@@ -113,9 +113,9 @@ class OrchestratorContext:
     # Intent actual recebido do HMI
     current_intent:    Optional[Intent] = None
 
-    # Último objecto detectado pela visão (imagem usada pelo grasping)
-    last_object_image: Optional[Image]  = None
-    last_object_name:  str              = ""
+    # Último objecto detectado pela visão (pose 6-DOF usada pelo grasping)
+    last_object_pose: Optional[Pose6DOF] = None
+    last_object_name: str                = ""
 
     # Última pessoa detetada por movimento dos lábios
     last_person_id:    str              = ""
@@ -257,7 +257,7 @@ class Orchestrator:
 
         if sample.acao in (Acao.ENTREGAR, Acao.RECOLHER):
             self._ctx.last_object_name  = sample.alvo
-            self._ctx.last_object_image = None
+            self._ctx.last_object_pose = None
             self._transition(Phase.LOCATING_OBJECT,
                              f"à procura de '{sample.alvo}'")
 
@@ -267,13 +267,20 @@ class Orchestrator:
                 header=self._make_header(),
                 objeto=sample.alvo,
                 objeto_id="drop",
-                image=Image(),
+                pose=Pose6DOF(),
                 postura=Posture.NEUTRAL,
             ))
             self._transition(Phase.DELIVERING, "a largar objeto")
 
         elif sample.acao == Acao.SEGUIR:
-            self._transition(Phase.NAVIGATING_TO_PERSON, "a seguir pessoa")
+            goal = self._build_person_goal()
+            if goal:
+                self._w_nav_goal.write(goal)
+                self._transition(Phase.NAVIGATING_TO_PERSON,
+                                    f"a seguir '{self._ctx.last_person_id}'")
+            else:
+                log.warning("SEGUIR pedido mas pessoa não identificada ainda — a aguardar.")
+                # Não transita — fica em WAITING_FOR_INTENT até a pessoa ser conhecida)
 
         elif sample.acao == Acao.PARAR:
             self._transition(Phase.IDLE, "paragem solicitada pelo operador")
@@ -288,13 +295,12 @@ class Orchestrator:
             if det.name == self._ctx.last_object_name \
                     and det.confidence >= VISION_MIN_CONF:
 
-                self._ctx.last_object_image = det.image
+                self._ctx.last_object_pose = det.pose
                 log.info("Objecto '%s' localizado (conf=%.2f)", det.name, det.confidence)
 
                 self._w_nav_goal.write(Goal(
                     header=self._make_header(),
-                    data=GoalData(discriminator=GoalType.NAMED,
-                                  name=TABLE_LOCATION_NAME),
+                    data=GoalData(GoalType.NAMED, TABLE_LOCATION_NAME),
                 ))
                 self._transition(Phase.NAVIGATING_TO_TABLE,
                                  f"a navegar para '{TABLE_LOCATION_NAME}'")
@@ -308,12 +314,12 @@ class Orchestrator:
 
         if sample.status == Status.DONE:
             # Chegou à mesa — pede ao grasping para estender o braço e agarrar
-            image = self._ctx.last_object_image or Image()
+            pose = self._ctx.last_object_pose or Pose6DOF()
             self._w_grasp_cmd.write(GraspCommand(
                 header=self._make_header(),
                 objeto=self._ctx.last_object_name,
                 objeto_id="",
-                image=image,
+                pose=pose,
                 postura=Posture.EXTEND_ARM_FORWARD,
             ))
             log.info("GraspCommand enviado para '%s' (braço estendido)",
@@ -338,7 +344,7 @@ class Orchestrator:
                     header=self._make_header(),
                     objeto=self._ctx.last_object_name,
                     objeto_id="carry",
-                    image=Image(),
+                    pose=Pose6DOF(),
                     postura=Posture.NEUTRAL,
                 ))
 
@@ -375,7 +381,7 @@ class Orchestrator:
                 header=self._make_header(),
                 objeto=self._ctx.last_object_name,
                 objeto_id="deliver",
-                image=Image(),
+                pose=Pose6DOF(),
                 postura=Posture.EXTEND_ARM_FORWARD,
             ))
             log.info("A entregar '%s' à pessoa '%s'",
@@ -393,13 +399,13 @@ class Orchestrator:
 
         if self._recover_until is None:
             # Se o robô tiver o objeto na mão, largar antes de recuperar
-            if self._ctx.last_object_image is not None:
+            if self._ctx.last_object_pose is not None:
                 log.warning("A largar objeto antes de recuperar...")
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto="",
                     objeto_id="drop",
-                    image=Image(),
+                    pose=Pose6DOF(),
                     postura=Posture.NEUTRAL,
                 ))
             self._recover_until = time.time() + 3.0
@@ -408,7 +414,7 @@ class Orchestrator:
 
         if time.time() >= self._recover_until:
             self._recover_until = None
-            self._ctx.last_object_image = None
+            self._ctx.last_object_pose = None
             self._transition(Phase.LOCATING_OBJECT, "a tentar novamente após recuperação")
 
     def _handle_aborted(self) -> None:
@@ -454,7 +460,7 @@ class Orchestrator:
                 if loc.name == self._ctx.last_person_id:
                     return Goal(
                         header=self._make_header(),
-                        data=GoalData(discriminator=GoalType.NAMED, name=loc.name),
+                        data=GoalData(GoalType.NAMED, loc.name),
                     )
 
         log.warning("Pessoa '%s' não encontrada nas localizações SLAM.",

@@ -30,8 +30,22 @@ class Quaternion(IdlStruct, typename="rt.common.Quaternion"):
 
 @dataclass
 class Pose(IdlStruct, typename="rt.common.Pose"):
+    """Pose 3D completa com quaternião — usada pelo SLAM e navegação."""
     position:    Vector3    = field(default_factory=Vector3)
     orientation: Quaternion = field(default_factory=Quaternion)
+
+
+@dataclass
+class Pose6DOF(IdlStruct, typename="rt.common.Pose6DOF"):
+    """Pose 6-DOF em ângulos de Euler — usada pela visão e pelo grasping.
+    Unidades: x, y, z em metros; roll, pitch, yaw em radianos.
+    """
+    x:     float = 0.0
+    y:     float = 0.0
+    z:     float = 0.0
+    roll:  float = 0.0
+    pitch: float = 0.0
+    yaw:   float = 0.0
 
 
 @dataclass
@@ -43,6 +57,7 @@ class Header(IdlStruct, typename="rt.common.Header"):
 
 @dataclass
 class Image(IdlStruct, typename="rt.common.Image"):
+    """Mantido para retrocompatibilidade (ex. HMI). Não usar no grasping."""
     width:    int             = 0
     height:   int             = 0
     encoding: str             = ""
@@ -91,9 +106,10 @@ class Feedback(IdlStruct, typename="rt.hmi.Feedback"):
 
 @dataclass
 class ObjectDetection(IdlStruct, typename="rt.vision.ObjectDetection"):
-    name:       str   = ""
-    confidence: float = 0.0
-    image:      Image = field(default_factory=Image)
+    """A visão publica a pose 6-DOF do objeto em vez da imagem."""
+    name:       str      = ""
+    confidence: float    = 0.0
+    pose:       Pose6DOF = field(default_factory=Pose6DOF)   # ← era Image
 
 
 @dataclass
@@ -106,6 +122,7 @@ class Objects(IdlStruct, typename="rt.vision.Objects"):
 class PersonDetection(IdlStruct, typename="rt.vision.PersonDetection"):
     id:                      str   = ""
     lip_movement_confidence: float = 0.0
+    yaw:                     float = 0.0   # ← novo: orientação da pessoa (rad)
 
 
 @dataclass
@@ -117,29 +134,26 @@ class Persons(IdlStruct, typename="rt.vision.Persons"):
 # ─── rt.grasp ────────────────────────────────────────────────────────────────
 
 class Posture(IdlEnum):
-    """Postura do braço comandada pelo orquestrador via GraspCommand.
-    O módulo de grasping é o único responsável pelo controlo do braço.
-    """
     EXTEND_ARM_FORWARD = auto()   # estender braço para agarrar ou entregar
     NEUTRAL            = auto()   # braço recolhido para transporte
     READY_TO_RECEIVE   = auto()   # braço preparado para receber objeto
 
 
+# Semântica de objeto_id em GraspCommand:
+#   ""         → agarrar o objeto indicado em `objeto`
+#   "carry"    → modo transporte (braço neutro com objeto na mão)
+#   "deliver"  → entregar à pessoa (abrir garra)
+#   "drop"     → largar imediatamente (falha/recuperação)
+#   "shutdown" → desligar módulo de grasping
+
+
 @dataclass
 class GraspCommand(IdlStruct, typename="rt.grasp.Command"):
-    """Publicado pelo orquestrador para o módulo de grasping.
-
-    Fluxo de uso:
-      1. Chegada à mesa   → postura=EXTEND_ARM_FORWARD, objeto+image preenchidos, objeto_id=""
-      2. Objeto agarrado  → postura=NEUTRAL, objeto_id="carry"  (braço em transporte)
-      3. Chegada à pessoa → postura=EXTEND_ARM_FORWARD, objeto_id="deliver"
-      4. Recovery c/ obj  → postura=NEUTRAL, objeto_id="drop"
-    """
-    header:    Header  = field(default_factory=Header)
-    objeto:    str     = ""
-    objeto_id: str     = ""    # "carry" | "deliver" | "drop" | "" (agarrar)
-    image:     Image   = field(default_factory=Image)
-    postura:   Posture = Posture.NEUTRAL
+    header:    Header   = field(default_factory=Header)
+    objeto:    str      = ""
+    objeto_id: str      = ""       # ver semântica acima
+    pose:      Pose6DOF = field(default_factory=Pose6DOF)   # ← era Image
+    postura:   Posture  = Posture.NEUTRAL
 
 
 @dataclass
@@ -177,7 +191,6 @@ class GoalType(IdlEnum):
     POSE  = auto()
 
 
-@dataclass
 class GoalData(IdlUnion, typename="rt.nav.GoalData", discriminator=GoalType):
     name: case[GoalType.NAMED, str]  = ""
     pose: case[GoalType.POSE,  Pose] = field(default_factory=Pose)
@@ -204,18 +217,14 @@ class NavPath(IdlStruct, typename="rt.nav.Path"):
 
 
 # ─── rt.motion ───────────────────────────────────────────────────────────────
-#
-# O módulo de motion é um seguidor de velocidades puro.
-# Recebe CmdVel da navegação e publica OdometryMsg para o SLAM/navegação.
-# O controlo do braço é responsabilidade exclusiva do módulo de grasping.
 
 @dataclass
 class CmdVel(IdlStruct, typename="rt.motion.CmdVel"):
     """Publicado pela navegação → consumido pelo motion a 50 Hz."""
     header: Header = field(default_factory=Header)
-    vx:     float  = 0.0   # velocidade linear frente/trás  (m/s)
-    vy:     float  = 0.0   # velocidade lateral esq/dir     (m/s)
-    wz:     float  = 0.0   # velocidade angular yaw          (rad/s)
+    vx:     float  = 0.0
+    vy:     float  = 0.0
+    wz:     float  = 0.0
 
 
 @dataclass
