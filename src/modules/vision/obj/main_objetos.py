@@ -4,12 +4,11 @@ import math
 import threading
 import time
 from typing import Optional
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# ── CycloneDDS ────────────────────────────────────────────────────────────────
+# CycloneDDS
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.pub    import Publisher,  DataWriter
 from cyclonedds.sub    import Subscriber, DataReader
@@ -18,7 +17,7 @@ from cyclonedds.topic  import Topic
 from qos_profiles import QOS_VISION, QOS_GRASP, QOS_ORCHESTRATION
 from idl_ri import (
     Header,
-    Image,
+    Pose6DOF,
     ObjectDetection,
     Objects,
     GraspCommand,
@@ -26,9 +25,7 @@ from idl_ri import (
     OrchestratorState,
 )
 
-# ──────────────────────────────────────────────
 # Logging
-# ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -36,9 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("g1_vision")
 
-# ──────────────────────────────────────────────
 # Constantes & Configuração
-# ──────────────────────────────────────────────
 WINDOW_NAME = "G1 ZMQ YOLO 6-DOF POSE"
 DOMAIN_ID   = 0
 
@@ -48,18 +43,16 @@ CX, CY = 320.0, 240.0
 
 # Confiança mínima por classe
 CLASS_CONF = {
-    "pasta":        0.55,
-    "pasta_dentes": 0.55,
-    "bola":         0.75,
-    "cubo":         0.75,
+    "pasta":        0.85,
+    "bola":         0.90,
+    "cubo":         0.90,
 }
 DEFAULT_CONF = 0.90
 
-# Cores BGR por classe (visualização)
+# Cores personalizadas para cada classe (BGR)
 CUSTOM_COLORS = {
     "bola":         (0,   255,   0),
     "pasta":        (128,   0, 128),
-    "pasta_dentes": (128,   0, 128),
     "cubo":         (0,     0, 255),
 }
 
@@ -75,13 +68,11 @@ NORMAL_OFFSETS = [
     ( 10, -10), (-10, -10),
 ]
 
-# ──────────────────────────────────────────────
 # Estado global partilhado entre threads
-# ──────────────────────────────────────────────
 _state      = {"rgbd": None, "depth_raw": None, "rgb_raw": None}
 _state_lock = threading.Lock()
 
-# Objeto alvo recebido do orquestrador (atualizado pela thread DDS)
+# Objeto alvo recebido do orquestrador
 _target_object      = ""
 _target_object_lock = threading.Lock()
 
@@ -101,11 +92,8 @@ def _make_header(frame_id: str = "camera") -> Header:
     return Header(timestamp_ns=time.time_ns(), frame_id=frame_id, seq=_next_seq())
 
 
-# ──────────────────────────────────────────────
 # Filtro EMA de pose por objeto
-# ──────────────────────────────────────────────
 class PoseFilter:
-    """Filtro de média exponencial (EMA) para suavizar pose entre frames."""
 
     def __init__(self, alpha: float = EMA_ALPHA):
         self.alpha = alpha
@@ -128,9 +116,7 @@ class PoseFilter:
 _pose_filters = {}   # type: dict
 
 
-# ──────────────────────────────────────────────
 # ZMQ Receiver (thread separada)
-# ──────────────────────────────────────────────
 def _rx_realsense(stop, robot_ip):
     # type: (threading.Event, str) -> None
     try:
@@ -196,12 +182,9 @@ def _rx_realsense(stop, robot_ip):
         log.error("[ZMQ] Erro fatal: %s", exc, exc_info=True)
 
 
-# ──────────────────────────────────────────────
 # DDS Subscriber — recebe objeto alvo do orquestrador
-# ──────────────────────────────────────────────
 def _rx_orchestrator(stop, reader):
     # type: (threading.Event, DataReader) -> None
-    """Lê OrchestratorState e atualiza o objeto alvo global."""
     global _target_object
     while not stop.is_set():
         samples = reader.take(10)
@@ -216,9 +199,7 @@ def _rx_orchestrator(stop, reader):
         time.sleep(0.05)
 
 
-# ──────────────────────────────────────────────
 # Geometria 3-D
-# ──────────────────────────────────────────────
 def _depth_patch(u, v, depth_raw):
     # type: (int, int, np.ndarray) -> float
     h, w = depth_raw.shape
@@ -230,6 +211,7 @@ def _depth_patch(u, v, depth_raw):
     return float(np.median(valid)) / 1000.0 if valid.size else 0.0
 
 
+# Estimar profundidade do objeto usando a máscara
 def _depth_from_mask(mask_pts, depth_raw):
     # type: (np.ndarray, np.ndarray) -> float
     h, w   = depth_raw.shape
@@ -245,6 +227,7 @@ def _depth_from_mask(mask_pts, depth_raw):
     return _depth_patch(int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]), depth_raw)
 
 
+# Converter coordenadas de pixel + profundidade para coordenadas 3D (m)
 def pixel_to_3d(u, v, z_m):
     # type: (int, int, float) -> Optional[np.ndarray]
     if z_m <= 0.0:
@@ -252,6 +235,7 @@ def pixel_to_3d(u, v, z_m):
     return np.array([(u - CX) * z_m / FX, (v - CY) * z_m / FY, z_m], dtype=np.float64)
 
 
+# Amostrar pontos 3D dentro da máscara para estimar a normal usando SVD
 def _sample_mask_points_3d(mask_pts, depth_raw, n=MASK_SAMPLES):
     # type: (np.ndarray, np.ndarray, int) -> list
     h, w   = depth_raw.shape
@@ -270,6 +254,7 @@ def _sample_mask_points_3d(mask_pts, depth_raw, n=MASK_SAMPLES):
     return pts
 
 
+# Estimar normal da superfície usando SVD nos pontos 3D amostrados da máscara
 def estimate_normal_svd(u, v, depth_raw, mask_pts=None):
     # type: (int, int, np.ndarray, Optional[np.ndarray]) -> Optional[np.ndarray]
     if mask_pts is not None:
@@ -303,9 +288,9 @@ def estimate_normal_svd(u, v, depth_raw, mask_pts=None):
     return normal / norm if norm > 1e-9 else None
 
 
+# Calcular pose 6-DOF e devolver como Pose6DOF IDL
 def compute_pose_6dof(u, v, depth_raw, mask_pts):
-    # type: (int, int, np.ndarray, np.ndarray) -> Optional[list]
-    """Retorna [X, Y, Z (m), roll, pitch, yaw (rad)] ou None."""
+    # type: (int, int, np.ndarray, np.ndarray) -> Optional[Pose6DOF]
     z_m      = _depth_from_mask(mask_pts, depth_raw)
     p_center = pixel_to_3d(u, v, z_m)
     if p_center is None:
@@ -320,52 +305,27 @@ def compute_pose_6dof(u, v, depth_raw, mask_pts):
     if rect_2d[1][0] < rect_2d[1][1]:
         yaw_deg += 90.0
     yaw = math.radians(yaw_deg)
-    return [
-        round(p_center[0], 4),  # X (m)
-        round(p_center[1], 4),  # Y (m)
-        round(p_center[2], 4),  # Z (m)
-        round(roll,        5),  # a1 — Roll  (rad)
-        round(pitch,       5),  # a2 — Pitch (rad)
-        round(yaw,         5),  # a3 — Yaw   (rad)
-    ]
+    return Pose6DOF(
+        x     = round(p_center[0], 4),
+        y     = round(p_center[1], 4),
+        z     = round(p_center[2], 4),
+        roll  = round(roll,        5),
+        pitch = round(pitch,       5),
+        yaw   = round(yaw,         5),
+    )
 
 
-# ──────────────────────────────────────────────
-# Crop do objeto para enviar no GraspCommand
-# ──────────────────────────────────────────────
-def _crop_to_image(rgb, box, size=64):
-    # type: (np.ndarray, object, int) -> Image
-    """Recorta bounding box do objeto e converte para Image IDL (rgb8, 64x64)."""
-    x1, y1, x2, y2 = map(int, box.xyxy[0])
-    crop = rgb[max(0, y1):y2, max(0, x1):x2]
-    if crop.size == 0:
-        return Image(width=size, height=size, encoding="rgb8",
-                     data=list(bytes(size * size * 3)))
-    crop_resized = cv2.resize(crop, (size, size))
-    # OpenCV usa BGR; converter para RGB
-    crop_rgb     = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
-    return Image(width=size, height=size, encoding="rgb8",
-                 data=list(crop_rgb.tobytes()))
-
-
-# ──────────────────────────────────────────────
 # Inferência & Publicação DDS
-# ──────────────────────────────────────────────
 def _run_inference(rgb_raw, depth_raw, frame_viz, model,
                    w_objects, w_grasp, ema_alpha=EMA_ALPHA):
     # type: (np.ndarray, np.ndarray, np.ndarray, YOLO, DataWriter, DataWriter, float) -> np.ndarray
-    """
-    Executa YOLO, calcula pose 6-DOF, publica no DDS e anota o frame.
-    """
     with _target_object_lock:
-        target = _target_object   # objeto alvo atual
+        target = _target_object
 
-    min_conf    = min(CLASS_CONF.values())
-    results     = model.predict(source=rgb_raw, conf=min_conf, verbose=False, device=0)
+    min_conf        = min(CLASS_CONF.values())
+    results         = model.predict(source=rgb_raw, conf=min_conf, verbose=False, device=0)
     detected_labels = set()
-
-    # Listas para publicação DDS
-    obj_detections = []   # type: list[ObjectDetection]
+    obj_detections  = []   # type: list[ObjectDetection]
 
     for r in results:
         overlay = frame_viz.copy()
@@ -388,92 +348,84 @@ def _run_inference(rgb_raw, depth_raw, frame_viz, model,
                 u = int(M["m10"] / M["m00"])
                 v = int(M["m01"] / M["m00"])
 
-                # Pose 6-DOF
-                raw_pose = compute_pose_6dof(u, v, depth_raw, mask_pts)
-                if raw_pose is None:
+                # Pose 6-DOF como Pose6DOF IDL
+                pose = compute_pose_6dof(u, v, depth_raw, mask_pts)
+                if pose is None:
                     log.debug("[%s] Sem profundidade valida em (%d,%d)", label, u, v)
                     continue
 
-                # Filtro EMA
+                # Filtro EMA (opera sobre lista, converte de/para Pose6DOF)
                 if label not in _pose_filters:
                     _pose_filters[label] = PoseFilter(alpha=ema_alpha)
-                pose = _pose_filters[label].update(raw_pose)
+                raw_list   = [pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw]
+                smooth     = _pose_filters[label].update(raw_list)
+                pose = Pose6DOF(
+                    x=smooth[0], y=smooth[1], z=smooth[2],
+                    roll=smooth[3], pitch=smooth[4], yaw=smooth[5],
+                )
 
-                # Log da pose 6-DOF
                 log.info(
                     "[%-12s] conf=%.2f  "
                     "X=%+.3fm  Y=%+.3fm  Z=%.3fm  "
-                    "a1=%+.4frad  a2=%+.4frad  a3=%+.4frad",
+                    "roll=%+.4frad  pitch=%+.4frad  yaw=%+.4frad",
                     label, conf,
-                    pose[0], pose[1], pose[2],
-                    pose[3], pose[4], pose[5],
+                    pose.x, pose.y, pose.z,
+                    pose.roll, pose.pitch, pose.yaw,
                 )
 
-                # ── Publicar ObjectDetection (rt/vision/objects) ──────────
+                # Publicar ObjectDetection com pose (rt/vision/objects)
                 obj_detections.append(ObjectDetection(
-                    name=label,
-                    confidence=conf,
-                    image=_crop_to_image(rgb_raw, box),
+                    name       = label,
+                    confidence = conf,
+                    pose       = pose,
                 ))
 
-                # ── Publicar GraspCommand se for o objeto alvo ────────────
-                label_norm = label.strip().lower()
+                # Publicar GraspCommand se for o objeto alvo
+                label_norm  = label.strip().lower()
                 target_norm = target.strip().lower()
                 if target_norm and label_norm == target_norm:
                     cmd = GraspCommand(
                         header    = _make_header(),
                         objeto    = label,
-                        objeto_id = "",                      # "" = agarrar
-                        image     = _crop_to_image(rgb_raw, box),
+                        objeto_id = "",
+                        pose      = pose,
                         postura   = Posture.EXTEND_ARM_FORWARD,
                     )
-                    # Adicionar pose como campo de texto estruturado
-                    # (o IDL não tem campos float livres; a pose vai no objeto_id
-                    #  como string JSON legível pelo grasping)
-                    import json
-                    cmd.objeto_id = json.dumps({
-                        "x":    pose[0],
-                        "y":    pose[1],
-                        "z":    pose[2],
-                        "a1":   pose[3],
-                        "a2":   pose[4],
-                        "a3":   pose[5],
-                    })
                     w_grasp.write(cmd)
                     log.info(
-                        "[DDS -> rt/grasp/command] objeto='%s'  pose=%s",
-                        label, pose,
+                        "[DDS -> rt/grasp/command] objeto='%s'  "
+                        "x=%.3f y=%.3f z=%.3f roll=%.4f pitch=%.4f yaw=%.4f",
+                        label,
+                        pose.x, pose.y, pose.z,
+                        pose.roll, pose.pitch, pose.yaw,
                     )
 
                 # Visualização
                 cv2.fillPoly(overlay, np.int32([mask_pts]), color)
                 cv2.circle(frame_viz, (u, v), 5, (255, 255, 255), -1)
                 yaw_len = 30
-                ux = int(u + yaw_len * math.cos(pose[5]))
-                uy = int(v + yaw_len * math.sin(pose[5]))
+                ux = int(u + yaw_len * math.cos(pose.yaw))
+                uy = int(v + yaw_len * math.sin(pose.yaw))
                 cv2.arrowedLine(frame_viz, (u, v), (ux, uy), color, 2, tipLength=0.3)
                 cv2.putText(
                     frame_viz,
-                    "Z={:.2f}m  a1={:.2f}".format(pose[2], pose[3]),
+                    "Z={:.2f}m  roll={:.2f}".format(pose.z, pose.roll),
                     (u + 8, v - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
                 )
 
-        # Overlay UMA vez por resultado
         frame_viz = cv2.addWeighted(overlay, ALPHA, frame_viz, 1 - ALPHA, 0)
 
-        # Bounding boxes
         for box in r.boxes:
             label = model.names[int(box.cls[0])]
             conf  = float(box.conf[0])
             if conf < CLASS_CONF.get(label, DEFAULT_CONF):
                 continue
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            color = CUSTOM_COLORS.get(label, (255, 255, 255))
-            cv2.rectangle(frame_viz, (x1, y1), (x2, y2), color, 2)
-            # Destacar objeto alvo com marcador visual
+            color      = CUSTOM_COLORS.get(label, (255, 255, 255))
             label_norm = label.strip().lower()
-            prefix = "[ALVO] " if (target and label_norm == target.strip().lower()) else ""
+            prefix     = "[ALVO] " if (target and label_norm == target.strip().lower()) else ""
+            cv2.rectangle(frame_viz, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 frame_viz,
                 "{}{} {:.2f}".format(prefix, label, conf),
@@ -481,7 +433,7 @@ def _run_inference(rgb_raw, depth_raw, frame_viz, model,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
             )
 
-    # Publicar lista de todos os objetos detetados (rt/vision/objects)
+    # Publicar lista de todos os objetos detetados
     if obj_detections:
         w_objects.write(Objects(
             header=_make_header(),
@@ -497,13 +449,11 @@ def _run_inference(rgb_raw, depth_raw, frame_viz, model,
     return frame_viz
 
 
-# ──────────────────────────────────────────────
 # Entrypoint
-# ──────────────────────────────────────────────
 def main():
     cv2.destroyAllWindows()
 
-    parser = argparse.ArgumentParser(description="G1 Vision v4 — ZMQ + YOLO + CycloneDDS")
+    parser = argparse.ArgumentParser(description="G1 Vision — ZMQ + YOLO + CycloneDDS")
     parser.add_argument("--robot-ip",   default="192.168.123.164")
     parser.add_argument("--model-path", default=(
         "/home/nova-lincs-04/unitree_sdk2_python/RI/3/"
@@ -515,25 +465,22 @@ def main():
     )
     args = parser.parse_args()
 
-    # ── DDS setup ─────────────────────────────────────────────────────────────
+    # DDS setup
     log.info("[DDS] A inicializar domínio %d ...", DOMAIN_ID)
     dp  = DomainParticipant(DOMAIN_ID)
     pub = Publisher(dp)
     sub = Subscriber(dp)
 
-    # Topics
     t_objects = Topic(dp, "rt/vision/objects",      Objects,           qos=QOS_VISION)
     t_grasp   = Topic(dp, "rt/grasp/command",       GraspCommand,      qos=QOS_GRASP)
     t_orch    = Topic(dp, "rt/orchestration/state", OrchestratorState, qos=QOS_ORCHESTRATION)
 
-    # Writers & Reader
     w_objects = DataWriter(pub, t_objects)
     w_grasp   = DataWriter(pub, t_grasp)
     r_orch    = DataReader(sub, t_orch)
 
     log.info("[DDS] Tópicos prontos.")
 
-    # ── Threads ───────────────────────────────────────────────────────────────
     stop_event = threading.Event()
 
     t_zmq = threading.Thread(
@@ -547,7 +494,6 @@ def main():
         daemon=True,
     )
 
-    # ── Modelo YOLO ───────────────────────────────────────────────────────────
     log.info("[YOLO] A carregar modelo: %s", args.model_path)
     model = YOLO(args.model_path)
 
@@ -568,7 +514,6 @@ def main():
                 time.sleep(0.01)
                 continue
 
-            # Cópias atómicas fora do lock
             frame_viz_copy = frame_viz.copy()
             depth_raw_copy = depth_raw.copy()
             rgb_raw_copy   = rgb_raw.copy()
@@ -583,7 +528,6 @@ def main():
                 ema_alpha = args.ema_alpha,
             )
 
-            # Mostrar objeto alvo atual no canto
             with _target_object_lock:
                 target_display = _target_object or "---"
             cv2.putText(

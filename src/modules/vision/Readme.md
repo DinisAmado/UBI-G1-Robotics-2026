@@ -60,16 +60,18 @@ Pipeline de visão com:
 
 ### Subscreve
 
-| Topic                    | Tipo                |
-| ------------------------ | ------------------- |
-| `rt/orchestration/state` | `OrchestratorState` |
+### Subscreve
+
+| Topic                    | Tipo                | Uso                                      |
+| ------------------------ | ------------------- | ---------------------------------------- |
+| `rt/orchestration/state` | `OrchestratorState` | Recebe o objeto alvo (`current_target_object`) |
 
 ### Publica
 
-| Topic               | Tipo           |
-| ------------------- | -------------- |
-| `rt/vision/objects` | `Objects`      |
-| `rt/grasp/command`  | `GraspCommand` |
+| Topic               | Tipo           | Dados                                          |
+| ------------------- | -------------- | ---------------------------------------------- |
+| `rt/vision/objects` | `Objects`      | Todos os objetos detetados com nome, confiança e pose 6-DOF |
+| `rt/grasp/command`  | `GraspCommand` | Pose 6-DOF do objeto alvo (x, y, z, roll, pitch, yaw) |
 
 ### Funções principais
 
