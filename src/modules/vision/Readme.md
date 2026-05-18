@@ -60,8 +60,6 @@ Pipeline de visão com:
 
 ### Subscreve
 
-### Subscreve
-
 | Topic                    | Tipo                | Uso                                      |
 | ------------------------ | ------------------- | ---------------------------------------- |
 | `rt/orchestration/state` | `OrchestratorState` | Recebe o objeto alvo (`current_target_object`) |
