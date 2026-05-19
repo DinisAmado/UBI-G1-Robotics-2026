@@ -466,7 +466,7 @@ def frase_imediata(action):
 # ==============================================================================
 def main():
     print("A carregar Whisper...")
-    whisper = WhisperModel(WHISPER_MODEL, device="gpu", compute_type="int8")
+    whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="int8")
     print("Whisper pronto!")
 
     try:
