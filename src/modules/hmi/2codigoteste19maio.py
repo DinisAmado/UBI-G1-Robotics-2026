@@ -47,7 +47,7 @@ VAD_SILENCE_SECS        = 1.2
 VAD_MIN_SPEECH_SECS     = 0.4
 PRE_BUFFER_SECS         = 0.5
 AUDIO_GAIN              = 1.6
-MAX_RECORDING_SECS      = 5.0
+MAX_RECORDING_SECS      = 3.0
 
 # Cores LEDs
 LED_A_OUVIR  = (0, 0, 255)   # azul
@@ -500,7 +500,7 @@ def main():
             try:
                 segs, _ = whisper.transcribe(
                     ficheiro, language="pt",
-                    beam_size=5, best_of=5,
+                    beam_size=1, best_of=1,
                     temperature=0.0,
                     condition_on_previous_text=False,
                     initial_prompt=(
