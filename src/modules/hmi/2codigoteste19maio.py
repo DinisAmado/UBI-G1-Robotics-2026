@@ -88,7 +88,9 @@ def contem(texto, frase):
 
 REGRAS = [
     (["traz", "traze", "traga", "traz-me", "traz me", "faz",
-      "vai buscar", "ir buscar", "busca", "procura"],  "TRAZER",    None),
+      "vai buscar", "ir buscar", "busca", "procura",
+      "e ai buscar", "e la buscar", "la buscar", "vai la buscar",
+      "vai ate", "e ai", "vai ali"],                   "TRAZER",    None),
     (["agarra", "pega", "apanha"],                     "AGARRAR",  None),
     (["larga"],                                        "LARGAR",   None),
     (["anda", "avanca", "vai para a frente"],          "ANDAR",    "NENHUM"),
@@ -326,6 +328,14 @@ class LedController:
         print("[LEDS] Vermelho: cancelado")
         self.set_color(*LED_CANCELADO)
 
+    def pendente(self):
+        print("[LEDS] Laranja: a aguardar confirmacao")
+        self.set_color(255, 80, 0)
+
+    def nao_percebeu(self):
+        print("[LEDS] Vermelho: nao percebeu")
+        self.set_color(*LED_CANCELADO)
+
     def desligar(self):
         print("[LEDS] Desligado")
         self.set_color(*LED_OFF)
@@ -526,10 +536,15 @@ def main():
                     resposta = "Ok, sem problema."
                 elif action in ACOES_COM_CONFIRMACAO:
                     pending = {"action": action, "target": target, "texto": texto}
+                    leds.pendente()
                     resposta = frase_confirmacao(action, target)
                 elif action in ACOES_IMEDIATAS:
                     publicar_dds(writer, texto, action, target)
                     resposta = frase_imediata(action)
+                elif action == "DESCONHECIDA" and target != "NENHUM":
+                    # Detetou objeto mas nao percebeu a acao — pede para repetir
+                    leds.nao_percebeu(); time.sleep(0.5)
+                    resposta = f"Percebi que queres algo com {NOME_TARGET.get(target, 'o objeto')}, mas não percebi o quê. Podes repetir?"
                 else:
                     historico.append({"role": "user", "content": texto})
                     resposta = conversar(historico)
