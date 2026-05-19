@@ -110,8 +110,9 @@ REGRAS = [
     (["nao", "cancela", "esquece", "afinal nao",
       "nao quero", "nao obrigado", "deixa estar",
       "para", "esquece isso"],                         "CANCELAR",       "NENHUM"),
-    (["sim", "claro", "faz isso", "ok", "pode ser",
-      "exato", "por favor", "faz favor", "confirmo"],  "CONFIRMAR",      "NENHUM"),
+    (["sim", "claro", "faz isso", "pode ser",
+      "exato", "por favor", "faz favor", "confirmo",
+      "quero sim", "sim por favor", "vai", "faz isso sim"],  "CONFIRMAR",      "NENHUM"),
 ]
 
 REGRAS_TARGET = [
