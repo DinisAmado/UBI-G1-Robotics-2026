@@ -10,7 +10,6 @@ from collections import deque
 import pygame
 from faster_whisper import WhisperModel
 import edge_tts
-import ollama as ollama_client
 import webrtcvad
 
 from cyclonedds.idl import IdlStruct
@@ -24,8 +23,7 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 # ==============================================================================
 # CONFIGURACAO
 # ==============================================================================
-WHISPER_MODEL  = "large-v3-turbo"
-OLLAMA_MODEL   = "qwen2.5:1.5b"
+WHISPER_MODEL  = "large-v3"
 TOPIC_NAME     = "HRICommands"
 AUDIO_TEMP     = "temp_hri.wav"
 AUDIO_RESP     = "resposta_hri.mp3"
@@ -47,7 +45,7 @@ VAD_SILENCE_SECS        = 1.2
 VAD_MIN_SPEECH_SECS     = 0.4
 PRE_BUFFER_SECS         = 0.5
 AUDIO_GAIN              = 1.6
-MAX_RECORDING_SECS      = 5.0
+MAX_RECORDING_SECS      = 3.0
 
 # Cores LEDs
 LED_A_OUVIR  = (0, 0, 255)   # azul
@@ -55,7 +53,7 @@ LED_A_FALAR  = (0, 255, 0)   # verde
 LED_CANCELADO = (255, 0, 0)  # vermelho
 LED_OFF      = (0, 0, 0)     # desligado
 
-ACOES_COM_CONFIRMACAO = {"IR_BUSCAR", "TRAZER", "AGARRAR"}
+ACOES_COM_CONFIRMACAO = {"TRAZER", "AGARRAR"}
 ACOES_IMEDIATAS = {
     "ANDAR", "PARAR", "RECUAR", "LEVANTAR", "SENTAR",
     "VIRAR_ESQUERDA", "VIRAR_DIREITA", "OLHAR_INTERLOCUTOR",
@@ -87,8 +85,13 @@ def contem(texto, frase):
     return bool(re.search(r"(?<![a-z])" + re.escape(frase) + r"(?![a-z])", texto))
 
 REGRAS = [
-    (["traz", "traze", "traga", "traz-me", "traz me"], "TRAZER",   None),
-    (["vai buscar", "ir buscar", "busca", "procura"],  "IR_BUSCAR", None),
+    (["traz", "traze", "traga", "traz-me", "traz me",
+      "trav", "tras", "traze-me", "trage", "trag",
+      "faz", "faz-me", "fas",
+      "vai buscar", "ir buscar", "busca", "procura",
+      "e ai buscar", "e la buscar", "la buscar", "vai la buscar",
+      "vai ate", "e ai", "vai ali",
+      "leva", "leva-me", "leva me", "traga-me"],        "TRAZER",    None),
     (["agarra", "pega", "apanha"],                     "AGARRAR",  None),
     (["larga"],                                        "LARGAR",   None),
     (["anda", "avanca", "vai para a frente"],          "ANDAR",    "NENHUM"),
@@ -132,21 +135,6 @@ def classificar(texto):
         target = "DESCONHECIDO"
     return {"action": action, "target": target}
 
-# ==============================================================================
-# OLLAMA
-# ==============================================================================
-SYSTEM_PROMPT = (
-    "Tu es o Johnny, um robo Unitree em Portugal. "
-    "Fala sempre em Portugues de Portugal (pt-PT). Se muito breve e simpatico. "
-    "Nunca uses mais de 2 frases."
-)
-
-def conversar(historico):
-    try:
-        r = ollama_client.chat(model=OLLAMA_MODEL, messages=historico)
-        return r["message"]["content"].strip()
-    except Exception as e:
-        return "Desculpa, tive um problema."
 
 # ==============================================================================
 # AUDIO — VAD + ZMQ
@@ -309,6 +297,7 @@ class LedController:
         if not self.disponivel:
             return
         try:
+            time.sleep(0.1)
             self.audio_client.LedControl(int(r), int(g), int(b))
         except Exception as e:
             print(f"[LEDS] Erro: {e}")
@@ -323,6 +312,14 @@ class LedController:
 
     def cancelar(self):
         print("[LEDS] Vermelho: cancelado")
+        self.set_color(*LED_CANCELADO)
+
+    def pendente(self):
+        print("[LEDS] Laranja: a aguardar confirmacao")
+        self.set_color(255, 80, 0)
+
+    def nao_percebeu(self):
+        print("[LEDS] Vermelho: nao percebeu")
         self.set_color(*LED_CANCELADO)
 
     def desligar(self):
@@ -391,10 +388,13 @@ def falar(texto, speaker, leds):
         await edge_tts.Communicate(texto, "pt-PT-DuarteNeural").save(AUDIO_RESP)
     asyncio.run(_g())
 
+    # LED verde ANTES de começar a falar — fica verde durante todo o audio
     leds.falar()
 
     if speaker.disponivel:
         ok = speaker.falar_mp3(AUDIO_RESP)
+        # LED volta a azul só DEPOIS do audio terminar
+        leds.ouvir()
         if ok:
             return
 
@@ -406,6 +406,8 @@ def falar(texto, speaker, leds):
     while pygame.mixer.music.get_busy():
         pygame.time.Clock().tick(10)
     pygame.mixer.quit()
+    # LED volta a azul só DEPOIS do audio terminar (fallback)
+    leds.ouvir()
 
 # ==============================================================================
 # DDS
@@ -424,14 +426,14 @@ NOME_TARGET = {
 def frase_confirmacao(action, target):
     nome = NOME_TARGET.get(target, "o objeto")
     if action == "TRAZER":    return f"Queres que eu traga {nome}?"
-    if action == "IR_BUSCAR": return f"Queres que eu vá buscar {nome}?"
+
     if action == "AGARRAR":   return f"Queres que eu agarre {nome}?"
     return f"Confirmas a ação com {nome}?"
 
 def frase_execucao(action, target):
     nome = NOME_TARGET.get(target, "o objeto")
     if action == "TRAZER":    return f"Combinado! Vou já trazer {nome}."
-    if action == "IR_BUSCAR": return f"Combinado! Vou já buscar {nome}."
+
     if action == "AGARRAR":   return f"Combinado! Vou agarrar {nome}."
     return "Combinado, vou já!"
 
@@ -452,14 +454,8 @@ def frase_imediata(action):
 # ==============================================================================
 def main():
     print("A carregar Whisper...")
-    whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+    whisper = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16")
     print("Whisper pronto!")
-
-    try:
-        ollama_client.chat(model=OLLAMA_MODEL, messages=[{"role": "user", "content": "ok"}])
-        print("Ollama pronto!")
-    except:
-        print("ERRO: ollama serve + ollama pull qwen2.5:1.5b"); sys.exit(1)
 
     # RobotSpeaker inicializa o ChannelFactory e o AudioClient
     speaker = RobotSpeaker()
@@ -470,12 +466,14 @@ def main():
     participant = DomainParticipant()
     topic = Topic(participant, TOPIC_NAME, HRICommand)
     writer = DataWriter(participant, topic)
-    historico = [{"role": "system", "content": SYSTEM_PROMPT}]
     pending = None
 
     print("=" * 52)
     print("   SISTEMA HRI -- UNITREE G1  (Ctrl+C para sair)")
     print("=" * 52 + "\n")
+
+    # Saudacao inicial
+    falar("Olá! Eu sou o Johnny. Em que posso ajudá-lo?", speaker, leds)
 
     try:
         while True:
@@ -484,6 +482,7 @@ def main():
             if not ficheiro:
                 continue
             try:
+                leds.pendente()  # laranja durante processamento Whisper
                 segs, _ = whisper.transcribe(
                     ficheiro, language="pt",
                     beam_size=5, best_of=5,
@@ -522,14 +521,24 @@ def main():
                     resposta = "Ok, sem problema."
                 elif action in ACOES_COM_CONFIRMACAO:
                     pending = {"action": action, "target": target, "texto": texto}
+                    leds.pendente()
                     resposta = frase_confirmacao(action, target)
                 elif action in ACOES_IMEDIATAS:
                     publicar_dds(writer, texto, action, target)
                     resposta = frase_imediata(action)
+                elif action == "DESCONHECIDA" and target != "NENHUM":
+                    # Detetou objeto mas nao percebeu a acao
+                    # Assume TRAZER (acao mais provavel) e confirma — seguro porque ha confirmacao
+                    pending = {"action": "TRAZER", "target": target, "texto": texto}
+                    leds.pendente()
+                    resposta = frase_confirmacao("TRAZER", target)
                 else:
-                    historico.append({"role": "user", "content": texto})
-                    resposta = conversar(historico)
-                    historico.append({"role": "assistant", "content": resposta})
+                    # Sem acao nem alvo reconhecido — resposta contextual sem LLM
+                    leds.nao_percebeu()
+                    if pending:
+                        resposta = "Não percebi. Queres confirmar ou cancelar?"
+                    else:
+                        resposta = "Não percebi o comando. Podes repetir por favor?"
 
                 print(f"[Johnny]: {resposta}")
                 falar(resposta, speaker, leds)
