@@ -87,10 +87,13 @@ def contem(texto, frase):
     return bool(re.search(r"(?<![a-z])" + re.escape(frase) + r"(?![a-z])", texto))
 
 REGRAS = [
-    (["traz", "traze", "traga", "traz-me", "traz me", "faz",
+    (["traz", "traze", "traga", "traz-me", "traz me",
+      "trav", "tras", "traze-me", "trage", "trag",
+      "faz", "faz-me", "fas",
       "vai buscar", "ir buscar", "busca", "procura",
       "e ai buscar", "e la buscar", "la buscar", "vai la buscar",
-      "vai ate", "e ai", "vai ali"],                   "TRAZER",    None),
+      "vai ate", "e ai", "vai ali",
+      "leva", "leva-me", "leva me", "traga-me"],        "TRAZER",    None),
     (["agarra", "pega", "apanha"],                     "AGARRAR",  None),
     (["larga"],                                        "LARGAR",   None),
     (["anda", "avanca", "vai para a frente"],          "ANDAR",    "NENHUM"),
@@ -500,7 +503,7 @@ def main():
             try:
                 segs, _ = whisper.transcribe(
                     ficheiro, language="pt",
-                    beam_size=1, best_of=1,
+                    beam_size=3, best_of=3,
                     temperature=0.0,
                     condition_on_previous_text=False,
                     initial_prompt=(
@@ -542,9 +545,11 @@ def main():
                     publicar_dds(writer, texto, action, target)
                     resposta = frase_imediata(action)
                 elif action == "DESCONHECIDA" and target != "NENHUM":
-                    # Detetou objeto mas nao percebeu a acao — pede para repetir
-                    leds.nao_percebeu(); time.sleep(0.5)
-                    resposta = f"Percebi que queres algo com {NOME_TARGET.get(target, 'o objeto')}, mas não percebi o quê. Podes repetir?"
+                    # Detetou objeto mas nao percebeu a acao
+                    # Assume TRAZER (acao mais provavel) e confirma — seguro porque ha confirmacao
+                    pending = {"action": "TRAZER", "target": target, "texto": texto}
+                    leds.pendente()
+                    resposta = frase_confirmacao("TRAZER", target)
                 else:
                     historico.append({"role": "user", "content": texto})
                     resposta = conversar(historico)
