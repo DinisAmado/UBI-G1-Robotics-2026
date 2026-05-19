@@ -25,7 +25,7 @@ from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 # CONFIGURACAO
 # ==============================================================================
 WHISPER_MODEL  = "large-v3-turbo"
-OLLAMA_MODEL   = "qwen2.5:1.5b"
+OLLAMA_MODEL   = "qwen2.5:0.5b"
 TOPIC_NAME     = "HRICommands"
 AUDIO_TEMP     = "temp_hri.wav"
 AUDIO_RESP     = "resposta_hri.mp3"
