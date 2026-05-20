@@ -22,7 +22,7 @@ from cyclonedds.sub import Subscriber, DataReader
 
 # QoS e IDL partilhados com a orquestração
 from qos_profiles import QOS_HMI
-from idl_ri import Header, Intent, Acao, Feedback, OrchestrationState
+from idl_ri import Header, Intent, Acao, Feedback, OrchestrationState, Status
 
 # Componentes HRI (reutiliza tudo do módulo principal)
 from hri_funciona import (
@@ -54,8 +54,8 @@ MAPA_ACAO = {
     "AGARRAR":        Acao.RECOLHER,   # agarra objeto
     "PARAR":          Acao.PARAR,      # para imediatamente
     "LARGAR":         Acao.LARGA,      # larga objeto
-    "ANDAR":          Acao.SEGUIR,     # avança
-    "RECUAR":         Acao.PARAR,      # para/recua
+    "ANDAR":          Acao.PARAR,      # sem equivalente direto — orquestrador ignora
+    "RECUAR":         Acao.PARAR,      # recuar
     "LEVANTAR":       Acao.PARAR,      # não mapeado diretamente
     "SENTAR":         Acao.PARAR,      # não mapeado diretamente
 }
@@ -70,14 +70,17 @@ MAPA_TARGET = {
 }
 
 # Mensagens de feedback do orquestrador → texto para o utilizador
-FEEDBACK_MENSAGENS = {
-    "IDLE":       "Estou pronto para receber comandos.",
-    "PLANNING":   "A planear a tarefa, um momento.",
-    "EXECUTING":  "A executar a tarefa.",
-    "SUCCESS":    "Tarefa concluída com sucesso!",
-    "FAILURE":    "Ocorreu um erro na execução da tarefa.",
-    "PAUSED":     "A operação foi pausada.",
-    "WAITING":    "À espera de confirmação para continuar.",
+# Baseado em OrchestrationState (fb.state) e Status (fb.status)
+FEEDBACK_ESTADO = {
+    OrchestrationState.IDLE:                 "",   # silêncio quando inativo
+    OrchestrationState.WAITING_FOR_INTENT:   "Estou pronto para receber comandos.",
+    OrchestrationState.LOCATING_OBJECT:      "A localizar o objeto, um momento.",
+    OrchestrationState.NAVIGATING_TO_TABLE:  "A navegar até à mesa.",
+    OrchestrationState.GRASPING_OBJECT:      "A agarrar o objeto.",
+    OrchestrationState.NAVIGATING_TO_PERSON: "A trazer o objeto até si.",
+    OrchestrationState.DELIVERING:           "A entregar o objeto.",
+    OrchestrationState.RECOVERING:           "Ocorreu um problema, a tentar recuperar.",
+    OrchestrationState.ABORTED:              "Operação cancelada.",
 }
 
 # ==============================================================================
@@ -122,23 +125,31 @@ def poll_feedback() -> Feedback | None:
     return samples[0] if samples else None
 
 def processar_feedback(fb: Feedback, speaker, leds) -> None:
-    """Lê o feedback e apresenta ao utilizador via TTS e LEDs."""
-    estado = fb.state.name if hasattr(fb.state, "name") else str(fb.state)
-    log.info("[FEEDBACK] estado=%s  msg=%s", estado, fb.message)
+    """Lê o feedback e apresenta ao utilizador via TTS e LEDs.
 
-    # Mensagem para o utilizador
-    msg_utilizador = fb.message if fb.message else FEEDBACK_MENSAGENS.get(estado, "")
+    fb.status — Status.RUNNING / Status.DONE / Status.FAILED
+    fb.state  — OrchestrationState (fase atual da orquestração)
+    fb.message — mensagem livre do orquestrador (pode estar vazia)
+    """
+    log.info("[FEEDBACK] status=%s  estado=%s  msg=%s",
+             fb.status.name, fb.state.name, fb.message)
+
+    # Prioridade: mensagem livre do orquestrador, depois mapeamento de estado
+    msg_utilizador = fb.message if fb.message else FEEDBACK_ESTADO.get(fb.state, "")
 
     if not msg_utilizador:
         return
 
-    # Ajusta cor do LED conforme o estado
-    if estado == "SUCCESS":
-        leds.falar()
-    elif estado == "FAILURE":
-        leds.nao_percebeu()
-    elif estado in ("EXECUTING", "PLANNING"):
-        leds.pendente()
+    # Cor do LED conforme o resultado
+    if fb.status == Status.DONE:
+        leds.falar()        # verde — sucesso
+    elif fb.status == Status.FAILED:
+        leds.nao_percebeu() # vermelho — falhou
+    elif fb.state in (OrchestrationState.NAVIGATING_TO_TABLE,
+                      OrchestrationState.NAVIGATING_TO_PERSON,
+                      OrchestrationState.GRASPING_OBJECT,
+                      OrchestrationState.LOCATING_OBJECT):
+        leds.pendente()     # laranja — a executar
 
     falar(msg_utilizador, speaker, leds)
 
