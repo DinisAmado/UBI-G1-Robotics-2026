@@ -16,11 +16,14 @@ Subscreve:
     rt/vision/persons        (Persons)
     rt/orchestration/state   (OrchestratorState)
 
-Nota:
-    Este ficheiro é apenas para integração DDS.
-    O demo.py continua a ser usado para testes com LiDAR, mapa e visualização.
+Modos úteis:
+    python3 main.py
+    python3 main.py --viz
+    python3 main.py --lidar --viz
+    python3 main.py --lidar --viz --host-ip 192.168.123.165
 """
 
+import argparse
 import os
 import sys
 import time
@@ -78,16 +81,39 @@ from qos_profiles import (
 # ==============================================================================
 
 from slam_navigation import SLAMNavigation
+from sensores import pointcloud_to_occupancy_points
+from livox_receiver import LivoxReceiver
 
 from navigation import (
     MAP_RESOLUTION,
-    MAP_ORIGIN_X,
-    MAP_ORIGIN_Y,
+
+    LOCAL_GOAL_STOP_DISTANCE_M,
+    LOCAL_GOAL_FRONT_ANGLE_DEG,
+    LOCAL_GOAL_MIN_DISTANCE_M,
+    LOCAL_GOAL_MAX_DISTANCE_M,
+    LOCAL_GOAL_SEARCH_RADIUS_M,
+    REPLAN_INTERVAL_S,
+
+    PERSON_CENTER_TOLERANCE,
+    PERSON_STOP_DISTANCE_M,
+    PERSON_FRONT_ANGLE_DEG,
+    PERSON_MIN_DISTANCE_M,
+    PERSON_MAX_DISTANCE_M,
+    PERSON_SEARCH_RADIUS_M,
+
     world_to_cell,
     cell_to_world,
     yaw_from_quaternion,
     quaternion_from_yaw,
+    normalize_angle,
+    find_nearest_front_obstacle_goal,
 )
+
+try:
+    from map_visualizer import MapVisualizer
+except Exception:
+    MapVisualizer = None
+
 
 # ==============================================================================
 # CONFIGURAÇÃO
@@ -99,9 +125,6 @@ log = logging.getLogger("navigation")
 MAP_SIZE = 200
 LOOP_DT = 0.02  # 50 Hz
 
-# Segurança:
-# False -> publica cmd_vel sempre a zero.
-# True  -> permite ativar movimento simples no futuro.
 ENABLE_MOTION = False
 
 GOAL_TOLERANCE_M = 0.25
@@ -111,13 +134,17 @@ MAX_LINEAR_SPEED = 0.15
 MAX_ANGULAR_SPEED = 0.30
 YAW_ALIGN_THRESHOLD = 0.35
 
-# Failsafe
 ODOM_TIMEOUT_S = 1.0
 CMD_ZERO_BURST_COUNT = 3
 SAFE_STATUS_INTERVAL_S = 0.5
 
-# Localizações temporárias para objetivos nomeados.
-# Mais tarde podem ser substituídas por dados reais vindos da orquestração/visão.
+LIDAR_MAX_RANGE_M = 4.0
+LIDAR_MIN_Z = -0.30
+LIDAR_MAX_Z = 1.50
+LIDAR_MIN_DIST_M = 0.20
+LIDAR_POINT_STEP = 5
+MAP_DECAY_FACTOR = 0.97
+
 KNOWN_LOCATIONS = {
     "inicio": (0.0, 0.0),
     "mesa": (2.0, 0.0),
@@ -127,20 +154,25 @@ KNOWN_LOCATIONS = {
     "pessoa_3": (3.0, 1.0),
 }
 
-# Parâmetros para centragem da pessoa com a informação da visão.
-PERSON_CENTER_TOLERANCE = 0.15
-PERSON_STOP_DISTANCE_M = 0.45
-PERSON_YAW_GAIN = 0.4
-PERSON_MAX_ROT_SPEED = 0.30
-
 
 # ==============================================================================
 # CLASSE PRINCIPAL
 # ==============================================================================
 
 class NavigationModule:
-    def __init__(self):
+    def __init__(
+        self,
+        enable_lidar=False,
+        enable_viz=False,
+        host_ip="192.168.123.165",
+        config_path="mid360_config.json",
+    ):
         self.seq = 0
+
+        self.enable_lidar = enable_lidar
+        self.enable_viz = enable_viz
+        self.host_ip = host_ip
+        self.config_path = config_path
 
         self.current_pose = Pose(
             position=Vector3(x=0.0, y=0.0, z=0.0),
@@ -150,11 +182,12 @@ class NavigationModule:
         self.current_yaw = 0.0
         self.current_goal = None
         self.current_goal_pose = None
+        self.current_goal_cell = None
+        self.current_obstacle_cell = None
         self.current_path = []
         self.current_waypoint_index = 0
         self.navigation_active = False
 
-        # Estado vindo da orquestração e da visão.
         self.current_phase = Phase.IDLE
         self.target_person_id = ""
         self.latest_persons = None
@@ -165,8 +198,8 @@ class NavigationModule:
         self.last_status_time = 0.0
         self.last_orch_log_time = 0.0
         self.last_vision_log_time = 0.0
+        self.last_replan_time = 0.0
 
-        # Failsafe.
         self.last_odom_time = 0.0
         self.last_safe_stop_reason = ""
         self.last_safe_stop_log_time = 0.0
@@ -176,8 +209,23 @@ class NavigationModule:
             map_size=MAP_SIZE,
             resolution=MAP_RESOLUTION,
             num_rays=144,
-            max_range=int(4.0 / MAP_RESOLUTION),
+            max_range=int(LIDAR_MAX_RANGE_M / MAP_RESOLUTION),
         )
+
+        self.lidar = None
+        if self.enable_lidar:
+            log.info("A iniciar Livox MID-360 | config=%s | host_ip=%s", self.config_path, self.host_ip)
+            self.lidar = LivoxReceiver(
+                config_path=self.config_path,
+                host_ip=self.host_ip,
+            )
+            log.info("Livox iniciado.")
+
+        self.visualizer = None
+        if self.enable_viz:
+            if MapVisualizer is None:
+                raise RuntimeError("Não foi possível importar MapVisualizer. Verifica o ficheiro map_visualizer.py.")
+            self.visualizer = MapVisualizer()
 
         # ----------------------------------------------------------------------
         # DDS SETUP
@@ -211,23 +259,11 @@ class NavigationModule:
         self.r_odom = DataReader(sub, t_odom)
 
         # Visão — pessoas
-        t_persons = Topic(
-            self.dp,
-            "rt/vision/persons",
-            Persons,
-            qos=QOS_VISION,
-        )
-
+        t_persons = Topic(self.dp, "rt/vision/persons", Persons, qos=QOS_VISION)
         self.r_persons = DataReader(sub, t_persons)
 
         # Orquestração — estado global
-        t_orch_state = Topic(
-            self.dp,
-            "rt/orchestration/state",
-            OrchestratorState,
-            qos=QOS_ORCHESTRATION,
-        )
-
+        t_orch_state = Topic(self.dp, "rt/orchestration/state", OrchestratorState, qos=QOS_ORCHESTRATION)
         self.r_orch_state = DataReader(sub, t_orch_state)
 
     # ==========================================================================
@@ -236,15 +272,16 @@ class NavigationModule:
 
     def header(self, frame_id="nav") -> Header:
         self.seq += 1
-        return Header(
-            timestamp_ns=time.time_ns(),
-            frame_id=frame_id,
-            seq=self.seq,
+        return Header(timestamp_ns=time.time_ns(), frame_id=frame_id, seq=self.seq)
+
+    def current_robot_cell(self):
+        return world_to_cell(
+            self.current_pose.position.x,
+            self.current_pose.position.y,
         )
 
     def pose_from_xy(self, x, y, yaw=0.0) -> Pose:
         qx, qy, qz, qw = quaternion_from_yaw(yaw)
-
         return Pose(
             position=Vector3(x=x, y=y, z=0.0),
             orientation=Quaternion(x=qx, y=qy, z=qz, w=qw),
@@ -255,47 +292,30 @@ class NavigationModule:
         dy = goal_pose.position.y - self.current_pose.position.y
         return math.sqrt(dx * dx + dy * dy)
 
-    def normalize_angle(self, angle):
-        return math.atan2(math.sin(angle), math.cos(angle))
-
     # ==========================================================================
     # PUBLICAÇÕES
     # ==========================================================================
 
     def publish_pose(self):
-        msg = SlamPoseMsg(
-            header=self.header("slam"),
-            pose=self.current_pose,
-        )
-        self.w_pose.write(msg)
+        self.w_pose.write(SlamPoseMsg(header=self.header("slam"), pose=self.current_pose))
 
     def publish_locations(self):
-        locs = []
+        locs = [
+            Location(name=name, pose=self.pose_from_xy(x, y))
+            for name, (x, y) in KNOWN_LOCATIONS.items()
+        ]
 
-        for name, (x, y) in KNOWN_LOCATIONS.items():
-            locs.append(
-                Location(
-                    name=name,
-                    pose=self.pose_from_xy(x, y),
-                )
-            )
-
-        msg = Locations(
-            header=self.header("slam"),
-            locations=locs,
-        )
-
-        self.w_locations.write(msg)
+        self.w_locations.write(Locations(header=self.header("slam"), locations=locs))
 
     def publish_status(self, status: Status, reason="", progress=0.0):
-        msg = NavStatusMsg(
-            header=self.header("nav"),
-            status=status,
-            reason=reason,
-            progress=progress,
+        self.w_status.write(
+            NavStatusMsg(
+                header=self.header("nav"),
+                status=status,
+                reason=reason,
+                progress=progress,
+            )
         )
-
-        self.w_status.write(msg)
         log.info("[STATUS] %s | %s | %.2f", status.name, reason, progress)
 
     def publish_path(self, path_cells):
@@ -305,34 +325,15 @@ class NavigationModule:
             x, y = cell_to_world(cell_x, cell_y)
             waypoints.append(self.pose_from_xy(x, y))
 
-        msg = NavPath(
-            header=self.header("nav"),
-            waypoints=waypoints,
-        )
-
-        self.w_path.write(msg)
+        self.w_path.write(NavPath(header=self.header("nav"), waypoints=waypoints))
 
     def send_cmd_vel(self, vx=0.0, vy=0.0, wz=0.0):
-        msg = CmdVel(
-            header=self.header("nav"),
-            vx=vx,
-            vy=vy,
-            wz=wz,
-        )
-
-        self.w_cmd_vel.write(msg)
+        self.w_cmd_vel.write(CmdVel(header=self.header("nav"), vx=vx, vy=vy, wz=wz))
 
     def stop_robot(self):
         self.send_cmd_vel(0.0, 0.0, 0.0)
 
     def safe_stop(self, reason="Paragem de segurança", publish_status=False):
-        """
-        Failsafe principal.
-
-        Sempre que houver problema, chama esta função para publicar cmd_vel = 0.
-        Em situações críticas, envia várias mensagens zero seguidas para aumentar
-        a probabilidade de o módulo de movimento receber a paragem.
-        """
         for _ in range(CMD_ZERO_BURST_COUNT):
             self.stop_robot()
 
@@ -371,11 +372,6 @@ class NavigationModule:
     # ==========================================================================
 
     def update_orchestration_state(self, state: OrchestratorState):
-        """
-        Atualiza a fase atual e a pessoa alvo vinda da orquestração.
-        Também usa active_modules.navigation como condição de segurança.
-        """
-
         previous_phase = self.current_phase
         previous_target = self.target_person_id
 
@@ -390,10 +386,7 @@ class NavigationModule:
             self.safe_stop("Orquestração desativou navigation")
 
         now = time.time()
-        changed = (
-            previous_phase != self.current_phase
-            or previous_target != self.target_person_id
-        )
+        changed = previous_phase != self.current_phase or previous_target != self.target_person_id
 
         if changed or now - self.last_orch_log_time >= 2.0:
             log.info(
@@ -405,12 +398,7 @@ class NavigationModule:
             self.last_orch_log_time = now
 
     def update_persons(self, persons: Persons):
-        """
-        Guarda as deteções de pessoas vindas da visão.
-        """
-
         self.latest_persons = persons
-
         target = self.get_target_person_detection()
 
         if target is None:
@@ -432,13 +420,6 @@ class NavigationModule:
             self.last_vision_log_time = now
 
     def get_target_person_detection(self):
-        """
-        Devolve a deteção da pessoa alvo.
-
-        Se a orquestração indicar current_target_person, procura esse id.
-        Se não houver id definido, escolhe a pessoa com maior lip_movement_confidence.
-        """
-
         if self.latest_persons is None:
             return None
 
@@ -452,15 +433,10 @@ class NavigationModule:
                 if person.id == self.target_person_id:
                     return person
 
-        # Fallback: escolher a pessoa com maior confiança.
         detections.sort(key=lambda p: p.lip_movement_confidence, reverse=True)
         return detections[0]
 
     def person_is_centered(self):
-        """
-        Verifica se a pessoa está centrada usando o yaw publicado pela visão.
-        """
-
         if not self.person_visible:
             return False
 
@@ -480,21 +456,10 @@ class NavigationModule:
         q = self.current_pose.orientation
         self.current_yaw = yaw_from_quaternion(q.x, q.y, q.z, q.w)
 
-        cell_x, cell_y = world_to_cell(
-            self.current_pose.position.x,
-            self.current_pose.position.y,
-        )
-
+        cell_x, cell_y = self.current_robot_cell()
         self.slam.update_pose(cell_x, cell_y, self.current_yaw)
 
     def odometry_is_recent(self):
-        """
-        Verifica se há odometria recente.
-
-        Enquanto ENABLE_MOTION=False, a ausência de odometria não bloqueia testes DDS,
-        porque o robô não vai mover-se. Quando ENABLE_MOTION=True, a odometria passa
-        a ser obrigatória para enviar velocidades diferentes de zero.
-        """
         if not ENABLE_MOTION:
             return True
 
@@ -504,17 +469,64 @@ class NavigationModule:
         return (time.time() - self.last_odom_time) <= ODOM_TIMEOUT_S
 
     # ==========================================================================
+    # LIDAR E MAPA
+    # ==========================================================================
+
+    def update_lidar_map(self):
+        if not self.enable_lidar or self.lidar is None:
+            return
+
+        xyz = self.lidar.get_latest_points()
+
+        if xyz is None:
+            return
+
+        curr_cell_x, curr_cell_y = self.current_robot_cell()
+
+        try:
+            obs, free = pointcloud_to_occupancy_points(
+                xyz,
+                curr_cell_x,
+                curr_cell_y,
+                self.current_yaw,
+                map_size=self.slam.map_size,
+                resolution=MAP_RESOLUTION,
+                max_range_meters=LIDAR_MAX_RANGE_M,
+                min_z=LIDAR_MIN_Z,
+                max_z=LIDAR_MAX_Z,
+                min_dist_m=LIDAR_MIN_DIST_M,
+                point_step=LIDAR_POINT_STEP,
+                apply_yaw=True,
+            )
+        except TypeError:
+            # Compatibilidade com versões antigas do sensores.py sem apply_yaw.
+            obs, free = pointcloud_to_occupancy_points(
+                xyz,
+                curr_cell_x,
+                curr_cell_y,
+                self.current_yaw,
+                map_size=self.slam.map_size,
+                resolution=MAP_RESOLUTION,
+                max_range_meters=LIDAR_MAX_RANGE_M,
+                min_z=LIDAR_MIN_Z,
+                max_z=LIDAR_MAX_Z,
+                min_dist_m=LIDAR_MIN_DIST_M,
+                point_step=LIDAR_POINT_STEP,
+            )
+
+        self.slam.decay_map(decay_factor=MAP_DECAY_FACTOR)
+
+        for pt in free:
+            self.slam._update_cell(pt[0], pt[1], False)
+
+        for pt in obs:
+            self.slam._update_cell(pt[0], pt[1], True)
+
+    # ==========================================================================
     # OBJETIVOS E PLANEAMENTO
     # ==========================================================================
 
     def get_goal_pose(self, goal: NavGoal):
-        """
-        Converte NavGoal para Pose.
-
-        Se o goal for NAMED, procura em KNOWN_LOCATIONS.
-        Se for POSE, usa a pose enviada.
-        """
-
         try:
             name = goal.data.name
 
@@ -535,13 +547,107 @@ class NavigationModule:
 
         return None
 
-    def plan_path(self, goal_pose: Pose):
-        goal_cell = world_to_cell(
-            goal_pose.position.x,
-            goal_pose.position.y,
-        )
-
+    def plan_path_to_cell(self, goal_cell):
+        if goal_cell is None:
+            return []
         return self.slam.plan_path(goal_cell, allow_unknown=True)
+
+    def plan_path_to_pose(self, goal_pose: Pose):
+        goal_cell = world_to_cell(goal_pose.position.x, goal_pose.position.y)
+        return self.plan_path_to_cell(goal_cell)
+
+    def set_goal_from_cell(self, goal_cell, obstacle_cell=None, reason="Objetivo local calculado"):
+        self.current_goal_cell = goal_cell
+        self.current_obstacle_cell = obstacle_cell
+
+        if goal_cell is None:
+            self.current_path = []
+            self.current_waypoint_index = 0
+            self.navigation_active = False
+            self.safe_stop("Não foi possível calcular objetivo local", publish_status=True)
+            return
+
+        goal_x, goal_y = cell_to_world(goal_cell[0], goal_cell[1])
+        self.current_goal_pose = self.pose_from_xy(goal_x, goal_y)
+
+        self.current_path = self.plan_path_to_cell(goal_cell)
+        self.current_waypoint_index = 0
+
+        if not self.current_path:
+            self.navigation_active = False
+            self.safe_stop("Não foi possível planear caminho para objetivo local", publish_status=True)
+            return
+
+        self.navigation_active = True
+        self.publish_path(self.current_path)
+        self.publish_status(Status.RUNNING, reason, 0.0)
+
+    def replan_from_orchestration_phase(self):
+        if not self.enable_lidar:
+            return
+
+        now = time.time()
+
+        if now - self.last_replan_time < REPLAN_INTERVAL_S and self.current_path:
+            return
+
+        robot_cell = self.current_robot_cell()
+
+        if self.current_phase == Phase.NAVIGATING_TO_TABLE:
+            goal_cell, obstacle_cell = find_nearest_front_obstacle_goal(
+                slam=self.slam,
+                robot_cell=robot_cell,
+                robot_yaw=self.current_yaw,
+                stop_distance_m=LOCAL_GOAL_STOP_DISTANCE_M,
+                front_angle_deg=LOCAL_GOAL_FRONT_ANGLE_DEG,
+                min_distance_m=LOCAL_GOAL_MIN_DISTANCE_M,
+                max_distance_m=LOCAL_GOAL_MAX_DISTANCE_M,
+                search_radius_m=LOCAL_GOAL_SEARCH_RADIUS_M,
+            )
+
+            self.set_goal_from_cell(
+                goal_cell,
+                obstacle_cell,
+                reason="Objetivo local calculado para a mesa",
+            )
+            self.last_replan_time = now
+
+        elif self.current_phase == Phase.NAVIGATING_TO_PERSON:
+            if not self.person_visible:
+                self.safe_stop("Pessoa alvo ainda não visível")
+                return
+
+            if not self.person_is_centered():
+                wz = max(
+                    -PERSON_MAX_ROT_SPEED,
+                    min(PERSON_MAX_ROT_SPEED, PERSON_YAW_GAIN * self.person_yaw_error),
+                )
+
+                if ENABLE_MOTION:
+                    self.send_cmd_vel(0.0, 0.0, wz)
+                else:
+                    self.safe_stop("Pessoa alvo visível, mas movimento desativado")
+
+                self.publish_status(Status.RUNNING, "A centrar pessoa alvo", 0.3)
+                return
+
+            goal_cell, obstacle_cell = find_nearest_front_obstacle_goal(
+                slam=self.slam,
+                robot_cell=robot_cell,
+                robot_yaw=self.current_yaw,
+                stop_distance_m=PERSON_STOP_DISTANCE_M,
+                front_angle_deg=PERSON_FRONT_ANGLE_DEG,
+                min_distance_m=PERSON_MIN_DISTANCE_M,
+                max_distance_m=PERSON_MAX_DISTANCE_M,
+                search_radius_m=PERSON_SEARCH_RADIUS_M,
+            )
+
+            self.set_goal_from_cell(
+                goal_cell,
+                obstacle_cell,
+                reason="Objetivo local calculado para a pessoa",
+            )
+            self.last_replan_time = now
 
     def handle_new_goal(self, goal: NavGoal):
         if not self.orchestration_allows_navigation:
@@ -553,6 +659,8 @@ class NavigationModule:
 
         self.current_goal = goal
         self.current_goal_pose = self.get_goal_pose(goal)
+        self.current_goal_cell = None
+        self.current_obstacle_cell = None
 
         log.info("[GOAL] recebido: %s", goal)
 
@@ -563,7 +671,7 @@ class NavigationModule:
             self.safe_stop("Objetivo inválido", publish_status=True)
             return
 
-        self.current_path = self.plan_path(self.current_goal_pose)
+        self.current_path = self.plan_path_to_pose(self.current_goal_pose)
         self.current_waypoint_index = 0
 
         if not self.current_path:
@@ -580,14 +688,6 @@ class NavigationModule:
     # ==========================================================================
 
     def follow_path_step(self):
-        """
-        Envia velocidades para seguir o caminho A*.
-
-        vx -> velocidade para a frente
-        vy -> velocidade lateral, por agora 0
-        wz -> velocidade angular
-        """
-
         if not self.current_path:
             self.safe_stop("Sem caminho para seguir")
             return 0.0
@@ -622,7 +722,7 @@ class NavigationModule:
             dist = math.sqrt(dx * dx + dy * dy)
 
         desired_yaw = math.atan2(dy, dx)
-        yaw_error = self.normalize_angle(desired_yaw - self.current_yaw)
+        yaw_error = normalize_angle(desired_yaw - self.current_yaw)
 
         if abs(yaw_error) > YAW_ALIGN_THRESHOLD:
             vx = 0.0
@@ -694,12 +794,25 @@ class NavigationModule:
 
         now = time.time()
         if now - self.last_status_time >= 0.5:
-            self.publish_status(
-                Status.RUNNING,
-                "A navegar",
-                progress,
-            )
+            self.publish_status(Status.RUNNING, "A navegar", progress)
             self.last_status_time = now
+
+    # ==========================================================================
+    # VISUALIZAÇÃO
+    # ==========================================================================
+
+    def update_visualization(self):
+        if not self.enable_viz or self.visualizer is None:
+            return
+
+        self.visualizer.update(
+            slam=self.slam,
+            robot_cell=self.current_robot_cell(),
+            yaw=self.current_yaw,
+            path=self.current_path,
+            goal_cell=self.current_goal_cell,
+            obstacle_cell=self.current_obstacle_cell,
+        )
 
     # ==========================================================================
     # LOOP PRINCIPAL
@@ -707,6 +820,7 @@ class NavigationModule:
 
     def run(self):
         log.info("SLAM + Navegação a iniciar no domínio %d", DOMAIN_ID)
+        log.info("Modo LiDAR=%s | Visualização=%s | ENABLE_MOTION=%s", self.enable_lidar, self.enable_viz, ENABLE_MOTION)
 
         self.publish_locations()
         self.publish_status(Status.DONE, "Módulo de navegação iniciado", 0.0)
@@ -728,6 +842,9 @@ class NavigationModule:
                 if persons:
                     self.update_persons(persons)
 
+                self.update_lidar_map()
+                self.replan_from_orchestration_phase()
+
                 self.publish_pose()
 
                 if now - self.last_locations_time >= 5.0:
@@ -739,6 +856,7 @@ class NavigationModule:
                     self.handle_new_goal(goal)
 
                 self.update_navigation()
+                self.update_visualization()
 
                 time.sleep(LOOP_DT)
 
@@ -755,6 +873,15 @@ class NavigationModule:
             self.safe_stop("Saída do programa")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Módulo SLAM/Navegação com DDS, LiDAR e visualização opcional.")
+    parser.add_argument("--lidar", action="store_true", help="Ativa leitura do Livox MID-360.")
+    parser.add_argument("--viz", action="store_true", help="Mostra janela Matplotlib com occupancy grid.")
+    parser.add_argument("--host-ip", default="192.168.123.165", help="IP usado pelo LivoxReceiver.")
+    parser.add_argument("--config-path", default="mid360_config.json", help="Caminho para o ficheiro de configuração do Livox.")
+    return parser.parse_args()
+
+
 # ==============================================================================
 # MAIN
 # ==============================================================================
@@ -765,4 +892,11 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] NAVIGATION: %(message)s",
     )
 
-    NavigationModule().run()
+    args = parse_args()
+
+    NavigationModule(
+        enable_lidar=args.lidar,
+        enable_viz=args.viz,
+        host_ip=args.host_ip,
+        config_path=args.config_path,
+    ).run()
