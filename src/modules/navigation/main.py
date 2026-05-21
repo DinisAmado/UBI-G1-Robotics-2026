@@ -82,7 +82,6 @@ from qos_profiles import (
 
 from slam_navigation import SLAMNavigation
 from sensores import pointcloud_to_occupancy_points
-from livox_receiver import LivoxReceiver
 
 from navigation import (
     MAP_RESOLUTION,
@@ -214,6 +213,11 @@ class NavigationModule:
 
         self.lidar = None
         if self.enable_lidar:
+            # Import lazy: só tenta importar o driver Livox quando --lidar é usado.
+            # Assim, python3 main.py --viz consegue abrir a visualização mesmo que
+            # livox_python/livox2_python ainda não esteja disponível no ambiente.
+            from livox_receiver import LivoxReceiver
+
             log.info("A iniciar Livox MID-360 | config=%s | host_ip=%s", self.config_path, self.host_ip)
             self.lidar = LivoxReceiver(
                 config_path=self.config_path,
