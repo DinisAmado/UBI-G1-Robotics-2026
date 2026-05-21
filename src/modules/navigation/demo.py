@@ -546,18 +546,19 @@ class RobotController:
                 # - passou algum tempo desde o último replaneamento.
                 #
                 # Em modo local, isto ajuda porque o mapa muda muito com o LiDAR.
-                path_needs_replan = (
+                                path_needs_replan = (
                     not current_path
                     or not slam.is_path_valid(current_path)
                     or (now - last_replan_time >= REPLAN_INTERVAL_S)
                 )
 
                 if path_needs_replan:
+
                     # ---------------------------------------------------
                     # FASE 1 — ir até à mesa
                     # ---------------------------------------------------
                     if mission_phase == "GO_TO_TABLE":
-                
+
                         current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
                             slam=slam,
                             robot_cell=(curr_cell_x, curr_cell_y),
@@ -568,72 +569,65 @@ class RobotController:
                             max_distance_m=LOCAL_GOAL_MAX_DISTANCE_M,
                             search_radius_m=LOCAL_GOAL_SEARCH_RADIUS_M
                         )
-                
+
                         if current_goal_cell is not None:
                             current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
-                
+
                             if not current_path:
                                 current_goal_cell = None
                         else:
                             current_path = []
-                
+
                     # ---------------------------------------------------
                     # FASE 2 — ir até à pessoa
                     # ---------------------------------------------------
                     elif mission_phase == "GO_TO_PERSON":
-                
-                        # A pessoa ainda não foi detetada pela visão
+
                         if not person_visible:
                             current_goal_cell = None
                             current_obstacle_cell = None
                             current_path = []
                             print("PESSOA | ainda não visível pela visão")
-                
-                        # A pessoa foi detetada, mas ainda não está centrada
+
                         elif not person_is_centered(person_offset_x):
                             current_goal_cell = None
                             current_obstacle_cell = None
                             current_path = []
 
-            print(
-                f"PESSOA | pessoa visível mas não centrada "
-                f"(offset_x={person_offset_x:.2f})"
-            )
+                            print(
+                                f"PESSOA | pessoa visível mas não centrada "
+                                f"(offset_x={person_offset_x:.2f})"
+                            )
 
-            # Mais tarde, aqui vamos enviar rotação:
-            #   offset_x < 0 -> rodar para um lado
-            #   offset_x > 0 -> rodar para o outro
+                        else:
+                            current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
+                                slam=slam,
+                                robot_cell=(curr_cell_x, curr_cell_y),
+                                robot_yaw=yaw,
+                                stop_distance_m=PERSON_STOP_DISTANCE_M,
+                                front_angle_deg=PERSON_FRONT_ANGLE_DEG,
+                                min_distance_m=PERSON_MIN_DISTANCE_M,
+                                max_distance_m=PERSON_MAX_DISTANCE_M,
+                                search_radius_m=PERSON_SEARCH_RADIUS_M
+                            )
 
-        # Pessoa centrada: agora o obstáculo frontal é assumido como a pessoa
-        else:
-            current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
-                slam=slam,
-                robot_cell=(curr_cell_x, curr_cell_y),
-                robot_yaw=yaw,
-                stop_distance_m=PERSON_STOP_DISTANCE_M,
-                front_angle_deg=PERSON_FRONT_ANGLE_DEG,
-                min_distance_m=PERSON_MIN_DISTANCE_M,
-                max_distance_m=PERSON_MAX_DISTANCE_M,
-                search_radius_m=PERSON_SEARCH_RADIUS_M
-            )
+                            if current_goal_cell is not None:
+                                current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
 
-            if current_goal_cell is not None:
-                current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
+                                if not current_path:
+                                    current_goal_cell = None
+                            else:
+                                current_path = []
 
-                if not current_path:
-                    current_goal_cell = None
-            else:
-                current_path = []
+                    # ---------------------------------------------------
+                    # FASE FINAL
+                    # ---------------------------------------------------
+                    else:
+                        current_goal_cell = None
+                        current_obstacle_cell = None
+                        current_path = []
 
-    # ---------------------------------------------------
-    # FASE FINAL
-    # ---------------------------------------------------
-    else:
-        current_goal_cell = None
-        current_obstacle_cell = None
-        current_path = []
-
-    last_replan_time = now
+                    last_replan_time = now
 
                 # Debug do objetivo automático
                 if now - last_goal_debug_time >= 1.5:
