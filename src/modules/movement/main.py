@@ -4,6 +4,7 @@ import time
 import logging
 import math
 
+#Alterar pastas
 pasta_atual = os.path.dirname(os.path.abspath(__file__))
 pasta_src = os.path.abspath(os.path.join(pasta_atual, '../..'))
 if pasta_src not in sys.path:
@@ -95,7 +96,7 @@ class MotionModule:
 
     def publish_odometry(self):
         try:
-            estado_robo = self.loco_client.GetState()
+            estado_robo = self.loco_client.GetState() # Testar com grep -n "def " /home/ri_user/g1_env/lib/python3.10/site-packages/unitree_sdk2py/g1/loco/g1_loco_client.py no pc main
             
             vx = estado_robo.velocity[0]
             vy = estado_robo.velocity[1]
