@@ -15,6 +15,7 @@ from cyclonedds.sub import Subscriber, DataReader
 from idl_ri import SlamPoseMsg, Locations, NavStatusMsg, NavPath, CmdVel
 from qos_profiles import QOS_SLAM_POSE, QOS_SLAM_MAP, QOS_NAV, QOS_MOTION
 
+
 dp = DomainParticipant(0)
 sub = Subscriber(dp)
 
@@ -33,29 +34,56 @@ r_cmd_vel = DataReader(sub, t_cmd_vel)
 print("A ouvir tópicos publicados pelo módulo navigation...")
 
 while True:
-    pose_samples = r_pose.take(1)
-    if pose_samples:
-        msg = pose_samples[0]
-        print(f"[POSE] x={msg.pose.position.x:.2f} y={msg.pose.position.y:.2f} seq={msg.header.seq}")
+    pose_samples = r_pose.take(10)
+    for msg in pose_samples:
+        if not hasattr(msg, "pose"):
+            continue
 
-    loc_samples = r_locations.take(1)
-    if loc_samples:
-        msg = loc_samples[0]
+        print(
+            f"[POSE] x={msg.pose.position.x:.2f} "
+            f"y={msg.pose.position.y:.2f} "
+            f"seq={msg.header.seq}"
+        )
+
+    loc_samples = r_locations.take(10)
+    for msg in loc_samples:
+        if not hasattr(msg, "locations"):
+            continue
+
         print(f"[LOCATIONS] n={len(msg.locations)} seq={msg.header.seq}")
 
-    status_samples = r_status.take(1)
-    if status_samples:
-        msg = status_samples[0]
-        print(f"[STATUS] {msg.status.name} | {msg.reason} | progress={msg.progress:.2f}")
+        for loc in msg.locations:
+            print(
+                f"  - {loc.name}: "
+                f"({loc.pose.position.x:.2f}, {loc.pose.position.y:.2f})"
+            )
 
-    path_samples = r_path.take(1)
-    if path_samples:
-        msg = path_samples[0]
+    status_samples = r_status.take(10)
+    for msg in status_samples:
+        if not hasattr(msg, "status"):
+            continue
+
+        print(
+            f"[STATUS] {msg.status.name} | "
+            f"{msg.reason} | progress={msg.progress:.2f}"
+        )
+
+    path_samples = r_path.take(10)
+    for msg in path_samples:
+        if not hasattr(msg, "waypoints"):
+            continue
+
         print(f"[PATH] waypoints={len(msg.waypoints)} seq={msg.header.seq}")
 
-    cmd_samples = r_cmd_vel.take(1)
-    if cmd_samples:
-        msg = cmd_samples[0]
-        print(f"[CMD_VEL] vx={msg.vx:.2f} vy={msg.vy:.2f} wz={msg.wz:.2f}")
+    cmd_samples = r_cmd_vel.take(10)
+    for msg in cmd_samples:
+        if not hasattr(msg, "vx"):
+            continue
+
+        print(
+            f"[CMD_VEL] vx={msg.vx:.2f} "
+            f"vy={msg.vy:.2f} "
+            f"wz={msg.wz:.2f}"
+        )
 
     time.sleep(0.05)
