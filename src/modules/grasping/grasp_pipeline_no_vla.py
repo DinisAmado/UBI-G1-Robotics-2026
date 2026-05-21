@@ -1,111 +1,45 @@
 """
-grasp_control.py
-================
-Integração completa: CycloneDDS + controlo de braços G1
 
-Comandos suportados (via tópico rt/grasp/command):
-  - postura=EXTEND_ARM_FORWARD, objeto_id=''         → "apanhar objeto"   (estados 0→1→2)
-  - postura=EXTEND_ARM_FORWARD, objeto_id='carry'    → "modo transporte"  (estado 3)
-  - postura=EXTEND_ARM_FORWARD, objeto_id='deliver'  → "entregar objeto"  (estado 4)
-  - postura=NEUTRAL,            objeto_id='drop'     → "largar imediato"  (estado 5)
-  - postura=NEUTRAL,            objeto_id='shutdown' → desligar script
+versão 2b: usa estado para controlar as ações
+versão 2c: replica posições gravadas com o código
+movimentar_joints_ler_valores.py
+que ficaram gravadas no file
+posições_braços_verter_água.txt
 
-Sequência de estados:
-  IDLE (−1)
-    │
-    ▼  EXTEND_ARM_FORWARD + objeto_id==''
-  INIT_POSITION (0)  → move para ArmStandardPosition + RightArmUP2Position
-    │
-    ▼
-  GRASPING (1)       → IK pré-grasp → desce → fecha mão
-    │
-    ▼
-  LIFT (2)           → levanta braço para RightArmUP2Position   [apanhar concluído]
-    │
-    ▼  EXTEND_ARM_FORWARD + objeto_id=='carry'
-  CARRY (3)          → braço neutro/transporte
-    │
-    ▼  EXTEND_ARM_FORWARD + objeto_id=='deliver'
-  DELIVERING (4)     → estica braço para ArmGivingPosition + abre garra
-    │   (ou directamente do IDLE/LIFT)
-    ▼  NEUTRAL + objeto_id=='drop'
-  DROPPING (5)       → abre mão imediatamente (recuperação de erro)
-    │
-    ▼
-  IDLE
 
-2026-05 — versão 4: semântica objeto_id actualizada, pose via Pose6DOF, tópico separado removido
+2026-04-20
 """
-
 import time
 import sys
 import json
-import logging
 import subprocess
-import threading
-
+from pathlib import Path
 import numpy as np
-from scipy.spatial.transform import Rotation as R
-
-# ── Unitree SDK ───────────────────────────────────────────────────────────────
-from unitree_sdk2py.core.channel import (
-    ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
-)
+from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowState_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
-
-# ── Hand control ──────────────────────────────────────────────────────────────
+from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+from unitree_sdk2py.idl.default import unitree_go_msg_dds__SportModeState_
+from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+import numpy as np
 from hand_control import HandControl
+#from wav import read_wav, play_pcm_stream
+from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from PIL import Image
+#from Image_now import get_image
+from scipy.spatial.transform import Rotation as R
 
-# ── CycloneDDS ───────────────────────────────────────────────────────────────
-from cyclonedds.domain import DomainParticipant
-from cyclonedds.topic import Topic
-from cyclonedds.pub import Publisher, DataWriter
-from cyclonedds.sub import Subscriber, DataReader
 
-from qos_profiles import QOS_GRASP
-from idl_ri import (
-    Header,
-    Status,
-    GraspCommand,
-    GraspStatusMsg,
-    Posture,
-    Pose6DOF,       # ← substituiu Image
-)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
-log = logging.getLogger('grasp_control')
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Constantes
-# ─────────────────────────────────────────────────────────────────────────────
-kPi   = 3.141592654
+kPi = 3.141592654
 kPi_2 = 1.57079632
 
-DOMAIN_ID = 0
 
-# Estados internos do robô
-STATE_IDLE       = -1
-STATE_INIT_POS   =  0   # mover para posição inicial + braço cima
-STATE_GRASPING   =  1   # IK pré-grasp → desce → fecha mão
-STATE_LIFT       =  2   # levanta braço (apanhar concluído)
-STATE_CARRY      =  3   # braço neutro para transporte
-STATE_DELIVERING =  4   # estica braço + abre garra (entregar)
-STATE_DROPPING   =  5   # abre mão imediatamente (drop/erro)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Configurações de movimento
-# ─────────────────────────────────────────────────────────────────────────────
 class MovementConfigs:
 
     # Posição padrão dos dois braços (joints 15-28)
@@ -130,499 +64,408 @@ class MovementConfigs:
 
     # Braço direito estendido para frente (entregar) — alterar conforme calibração
     ArmGivingPosition = [
-        (22, -0.5741), (23, -0.1391), (24, -0.2563),
-        (25,  0.5985), (26, -0.0296), (27, -0.1613), (28,  0.1152),
+        (22, -0.8576), (23, -0.101), (24, 0.0354), (25, 0.411), (26, 0.2811), (27, 0.1713), (28, 0.0899)
     ]
 
     # Braço direito em posição de transporte (carry) — neutro ao lado do corpo
     ArmCarryPosition = [
-        (22,  0.1035), (23, -0.3205), (24, -0.0719), (25,  0.0792),
-        (26, -0.0667), (27,  0.0186), (28, -0.0127),
+        (22, -0.2214), (23, -0.0227), (24, -0.2982), (25, 0.04), (26, 0.171), (27, -1.0556), (28, -0.0411)
     ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mapeamento de joints
-# ─────────────────────────────────────────────────────────────────────────────
+
 class G1JointIndex:
-    LeftHipPitch    =  0;  LeftHipRoll     =  1;  LeftHipYaw      =  2
-    LeftKnee        =  3;  LeftAnklePitch  =  4;  LeftAnkleRoll   =  5
+    # Left leg
+    LeftHipPitch = 0
+    LeftHipRoll = 1
+    LeftHipYaw = 2
+    LeftKnee = 3
+    LeftAnklePitch = 4
+    LeftAnkleB = 4
+    LeftAnkleRoll = 5
+    LeftAnkleA = 5
 
-    RightHipPitch   =  6;  RightHipRoll    =  7;  RightHipYaw     =  8
-    RightKnee       =  9;  RightAnklePitch = 10;  RightAnkleRoll  = 11
+    # Right leg
+    RightHipPitch = 6
+    RightHipRoll = 7
+    RightHipYaw = 8
+    RightKnee = 9
+    RightAnklePitch = 10
+    RightAnkleB = 10
+    RightAnkleRoll = 11
+    RightAnkleA = 11
 
-    WaistYaw        = 12;  WaistRoll       = 13;  WaistPitch      = 14
+    WaistYaw = 12
+    WaistRoll = 13        # NOTE: INVALID for g1 23dof/29dof with waist locked
+    WaistA = 13           # NOTE: INVALID for g1 23dof/29dof with waist locked
+    WaistPitch = 14       # NOTE: INVALID for g1 23dof/29dof with waist locked
+    WaistB = 14           # NOTE: INVALID for g1 23dof/29dof with waist locked
 
-    LeftShoulderPitch  = 15;  LeftShoulderRoll  = 16;  LeftShoulderYaw  = 17
-    LeftElbow          = 18;  LeftWristRoll     = 19;  LeftWristPitch   = 20
-    LeftWristYaw       = 21
+    # Left arm
+    LeftShoulderPitch = 15
+    LeftShoulderRoll = 16
+    LeftShoulderYaw = 17
+    LeftElbow = 18
+    LeftWristRoll = 19
+    LeftWristPitch = 20   # NOTE: INVALID for g1 23dof
+    LeftWristYaw = 21     # NOTE: INVALID for g1 23dof
 
-    RightShoulderPitch = 22;  RightShoulderRoll = 23;  RightShoulderYaw = 24
-    RightElbow         = 25;  RightWristRoll    = 26;  RightWristPitch  = 27
-    RightWristYaw      = 28
+    # Right arm
+    RightShoulderPitch = 22
+    RightShoulderRoll = 23
+    RightShoulderYaw = 24
+    RightElbow = 25
+    RightWristRoll = 26
+    RightWristPitch = 27  # NOTE: INVALID for g1 23dof
+    RightWristYaw = 28    # NOTE: INVALID for g1 23dof
 
-    kNotUsedJoint = 29   # activar arm_sdk com q=1
+    kNotUsedJoint = 29 # NOTE: Weight
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Camada de comunicação CycloneDDS (thread-safe)
-# Subscreve apenas: rt/grasp/command
-# Publica apenas:   rt/grasp/status
-# A pose do objeto vem dentro do GraspCommand (campo pose: Pose6DOF)
-# ─────────────────────────────────────────────────────────────────────────────
-class GraspComms:
-
-    def __init__(self):
-        self._dp  = DomainParticipant(DOMAIN_ID)
-        self._pub = Publisher(self._dp)
-        self._sub = Subscriber(self._dp)
-
-        # Único tópico subscrito
-        self._t_cmd    = Topic(self._dp, 'rt/grasp/command', GraspCommand,   qos=QOS_GRASP)
-        self._r_cmd    = DataReader(self._sub, self._t_cmd)
-
-        # Tópico de status publicado
-        self._t_status = Topic(self._dp, 'rt/grasp/status',  GraspStatusMsg, qos=QOS_GRASP)
-        self._w_status = DataWriter(self._pub, self._t_status)
-
-        self._lock       = threading.Lock()
-        self._seq        = 0
-        self.pending_cmd: GraspCommand | None = None
-
-        # Thread de polling DDS (daemon — termina com o processo principal)
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name='dds_poll'
-        )
-        self._poll_thread.start()
-        log.info('GraspComms iniciado no domínio %d', DOMAIN_ID)
-
-    # ── Polling interno ───────────────────────────────────────────────────────
-    def _poll_loop(self):
-        while True:
-            samples = self._r_cmd.take(1)
-            if samples:
-                with self._lock:
-                    self.pending_cmd = samples[0]
-                cmd = samples[0]
-                log.info('Comando recebido: postura=%s objeto=%s objeto_id=%s',
-                         cmd.postura, cmd.objeto, cmd.objeto_id)
-            time.sleep(0.02)   # 50 Hz
-
-    # ── API pública ───────────────────────────────────────────────────────────
-    def take_cmd(self) -> GraspCommand | None:
-        """Devolve e limpa o comando pendente (thread-safe)."""
-        with self._lock:
-            cmd = self.pending_cmd
-            self.pending_cmd = None
-        return cmd
-
-    def report_status(self, status: Status, reason: str = '', progress: float = 0.0):
-        with self._lock:
-            self._seq += 1
-            seq = self._seq
-        self._w_status.write(GraspStatusMsg(
-            header=Header(
-                timestamp_ns=time.time_ns(),
-                frame_id='grasp',
-                seq=seq,
-            ),
-            status=status,
-            reason=reason,
-            progress=progress,
-        ))
-        log.info('Status: %s (%.0f%%) — %s', status, progress * 100, reason)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Controlador principal
-# ─────────────────────────────────────────────────────────────────────────────
 class Custom:
-
     def __init__(self):
-        self.time_       = 0.0
-        self.control_dt_ = 0.02   # 50 Hz
-        self.kp          = 100.
-        self.kd          = 5.
-
-        self.low_cmd   = unitree_hg_msg_dds__LowCmd_()
+        self.time_ = 0.0
+        self.control_dt_ = 0.02
+        self.counter_ = 0
+        self.weight = 0.
+        self.weight_rate = 0.2
+        self.kp = 100 # 60.
+        self.kd = 5 # 1.5
+        self.dq = 0.
+        self.tau_ff = 0.
+        self.mode_machine_ = 0
+        self.low_cmd = unitree_hg_msg_dds__LowCmd_()
         self.low_state = None
         self.first_update_low_state = False
-        self.crc  = CRC()
+        self.crc = CRC()
         self.done = False
+        # 0= inicio, 1=levantou braço, 2=abriu mão, 3=rodou tronco, 4=fechou mão,
+        # 5=rodou para posição incial, 6=fim
+        self.estado = 0
+        # Configuração de ações
+        self.action_configs = {}
 
-        # Estado interno da máquina de estados
-        self.estado: int = STATE_IDLE
+        self.target_pos = [
+            0., kPi_2,  0., kPi_2, 0., 0., 0.,
+            0., -kPi_2, 0., kPi_2, 0., 0., 0.,
+            0, 0, 0
+        ]
 
-        # Pose do objeto (SE3 4×4) preenchida quando chega o comando de grasp
-        self.target_object_pose: np.ndarray | None = None
-
-        # Poses iniciais capturadas no primeiro ciclo
+        self.arm_joints = [
+          G1JointIndex.LeftShoulderPitch,  G1JointIndex.LeftShoulderRoll,
+          G1JointIndex.LeftShoulderYaw,    G1JointIndex.LeftElbow,
+          G1JointIndex.LeftWristRoll,      G1JointIndex.LeftWristPitch,
+          G1JointIndex.LeftWristYaw,
+          G1JointIndex.RightShoulderPitch, G1JointIndex.RightShoulderRoll,
+          G1JointIndex.RightShoulderYaw,   G1JointIndex.RightElbow,
+          G1JointIndex.RightWristRoll,     G1JointIndex.RightWristPitch,
+          G1JointIndex.RightWristYaw,
+        ]
         self.waist_init = None
-        self.left_init  = None
         self.right_init = None
+        self.left_init = None
 
-        # Comunicações DDS
-        self.comms = GraspComms()
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Inicialização SDK
-    # ─────────────────────────────────────────────────────────────────────────
     def Init(self):
+        # create publisher #
         self.arm_sdk_publisher = ChannelPublisher("rt/arm_sdk", LowCmd_)
         self.arm_sdk_publisher.Init()
 
+        # create subscriber #
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 10)
 
-        self.hand_r = HandControl("R")
-        log.info('Custom.Init() concluído')
+        # Iniciar controlo das maos -----------------------------------------------------------------------------
+        hand_side = "R"
+        self.hand_r = HandControl(hand_side)
 
     def Start(self):
         self.lowCmdWriteThreadPtr = RecurrentThread(
             interval=self.control_dt_, target=self.My_Control, name="control"
         )
-        log.info('À espera do primeiro LowState...')
-        while not self.first_update_low_state:
-            time.sleep(0.1)
-        self.lowCmdWriteThreadPtr.Start()
-        log.info('Thread de controlo iniciada')
+        while self.first_update_low_state == False:
+            time.sleep(1)
+
+        if self.first_update_low_state == True:
+            self.lowCmdWriteThreadPtr.Start()
 
     def LowStateHandler(self, msg: LowState_):
         self.low_state = msg
-        if not self.first_update_low_state:
+
+        if self.first_update_low_state == False:
             self.first_update_low_state = True
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Helpers de movimento
-    # ─────────────────────────────────────────────────────────────────────────
-    def _set_joint(self, j: int, q: float, kp: float = None, kd: float = None):
-        cmd = self.low_cmd.motor_cmd[j]
-        cmd.q   = q
-        cmd.dq  = 0.0
-        cmd.tau = 0.0
-        cmd.kp  = kp if kp is not None else self.kp
-        cmd.kd  = kd if kd is not None else self.kd
 
-    def _fix_waist(self):
-        for idx, j in enumerate([12, 13, 14]):
-            self._set_joint(j, self.waist_init[idx], kp=200, kd=10)
+    def _pose_to_SE3(self,action):
 
-    def _fix_left_arm(self):
-        for idx, j in enumerate(range(15, 22)):
-            self._set_joint(j, self.left_init[idx], kp=200, kd=10)
-
-    def _flush(self):
-        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
-        self.arm_sdk_publisher.Write(self.low_cmd)
-
-    def move_joints(self, targets: list, duration: float = 2.0):
         """
-        Movimento suave (smoothstep cúbico) para os joints indicados.
-        Bloqueia até ao fim. Mantém cintura e braço esquerdo fixos.
+        Convert absolute [x, y, z, roll, pitch, yaw] from Octo to a 4×4 SE3 matrix.
+        """
+        x, y, z = action[:3]
+        roll, pitch, yaw = action[3:6]
+        se3 = np.eye(4)
+        se3[:3, :3] = R.from_euler("xyz", [roll, pitch, yaw]).as_matrix()
+        se3[:3, 3] = [x, y, z]
+        return se3
+
+    def _solve_ik_run(self, left_wrist: np.ndarray, right_wrist: np.ndarray, current_q=None) -> list:
+        cmd = [
+            "conda", "run", "-n", "g1_ik",
+            "python", "run_ik.py",
+            "--left",  json.dumps(left_wrist.tolist()),
+            "--right", json.dumps(right_wrist.tolist()),
+        ]
+        if current_q is not None:
+            cmd += ["--current_q", json.dumps(current_q.tolist())]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"IK subprocess failed:\n{result.stderr}")
+        # Find the JSON line — it's the one starting with '['
+        json_line = None
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                json_line = line
+                break
+        if json_line is None:
+            raise RuntimeError(f"No JSON found in stdout:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+        return [tuple(pair) for pair in json.loads(json_line)]
+
+    def move_joints(self, targets, duration=2.0):
+        """
+        Smoothly move selected joints to target positions.
+        targets: list of (joint_index, target_q)
         """
         if self.low_state is None:
-            log.warning('move_joints: low_state não disponível')
+            print("No state available yet.")
             return
-
-        start_q = {j: self.low_state.motor_state[j].q for j, _ in targets}
-        t0      = time.time()
-
+        # capture start pose ONCE
+        start_q = {
+            j: self.low_state.motor_state[j].q
+            for j, _ in targets
+        } 
+        start_time = time.time()
+        print("Starting smooth joint motion...")
         while True:
-            t     = min((time.time() - t0) / duration, 1.0)
-            ratio = t * t * (3.0 - 2.0 * t)   # smoothstep
-
-            for j, q_target in targets:
-                q = (1.0 - ratio) * start_q[j] + ratio * q_target
-                self._set_joint(j, q)
-
-            self._fix_waist()
-            self._fix_left_arm()
-            self._flush()
-
+            # real elapsed time
+            t = (time.time() - start_time) / duration
+            t = np.clip(t, 0.0, 1.0)
+            # smoothstep (cubic easing)
+            ratio = t * t * (3 - 2 * t)
+            for joint, target_q in targets:
+                q0 = start_q[joint]
+                q = (1 - ratio) * q0 + ratio * target_q
+                cmd = self.low_cmd.motor_cmd[joint]
+                cmd.tau = 0
+                cmd.q = q
+                cmd.dq = 0
+                cmd.kp = self.kp
+                cmd.kd = self.kd
+            self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+            self.arm_sdk_publisher.Write(self.low_cmd)
             if t >= 1.0:
                 break
             time.sleep(self.control_dt_)
+        print("Motion complete")
 
-        log.info('move_joints concluído (%.1fs)', duration)
+    def fixa_waist(self):
+        for idx, j in enumerate([12, 13, 14]):
+            self.low_cmd.motor_cmd[j].q  = self.waist_init[idx]
+            self.low_cmd.motor_cmd[j].dq = 0.0
+            self.low_cmd.motor_cmd[j].kp = 200
+            self.low_cmd.motor_cmd[j].kd = 10
+            self.low_cmd.motor_cmd[j].tau = 0.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Cinemática inversa
-    # ─────────────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _pose6dof_to_SE3(pose: Pose6DOF) -> np.ndarray:
-        """Pose6DOF (x,y,z,roll,pitch,yaw) → 4×4 SE3."""
-        se3 = np.eye(4)
-        se3[:3, :3] = R.from_euler('xyz', [pose.roll, pose.pitch, pose.yaw]).as_matrix()
-        se3[:3,  3] = [pose.x, pose.y, pose.z]
-        return se3
 
-    def _solve_ik_run(
-        self,
-        left_wrist:  np.ndarray,
-        right_wrist: np.ndarray,
-        current_q:   np.ndarray | None = None,
-    ) -> list:
-        cmd = [
-            'conda', 'run', '-n', 'g1_ik',
-            'python', 'run_ik.py',
-            '--left',  json.dumps(left_wrist.tolist()),
-            '--right', json.dumps(right_wrist.tolist()),
-        ]
-        if current_q is not None:
-            cmd += ['--current_q', json.dumps(current_q.tolist())]
+    def next_state(self):
+        self.estado += 1
+        print(self.time_)
+        print(f"self.estado={self.estado }" )
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f'IK falhou:\n{result.stderr}')
-
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith('['):
-                return [tuple(pair) for pair in json.loads(line)]
-
-        raise RuntimeError(f'Sem JSON no stdout:\n{result.stdout}')
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Sequências de acção
-    # ─────────────────────────────────────────────────────────────────────────
-    def _do_init_position(self):
-        """Estado 0 — move para posição padrão + braço direito cima."""
-        log.info('[Estado 0] INIT_POSITION')
-        self.comms.report_status(Status.RUNNING, reason='init_position', progress=0.1)
-
-        self.move_joints(MovementConfigs.ArmStandardPosition, duration=2.0)
-        self.move_joints(MovementConfigs.RightArmUP2Position,  duration=2.0)
-
-        self.comms.report_status(Status.RUNNING, reason='init_done', progress=0.2)
-        self.estado = STATE_GRASPING
-
-    def _do_grasping(self):
-        """Estado 1 — IK pré-grasp → desce → fecha mão."""
-        if self.target_object_pose is None:
-            log.error('[Estado 1] target_object_pose não definida — abortar')
-            self.comms.report_status(Status.ERROR, reason='no_object_pose')
-            self.estado = STATE_IDLE
-            return
-
-        log.info('[Estado 1] GRASPING')
-        self.comms.report_status(Status.RUNNING, reason='grasping', progress=0.3)
-
-        T_obj      = self.target_object_pose
-        left_wrist = np.eye(4)
-
-        # pré-grasp: 15 cm acima
-        T_pregrasp         = T_obj.copy()
-        T_pregrasp[:3, 3] += np.array([0.0, 0.15, 0.0])
-
-        q_current = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
-        right_pregrasp = self._solve_ik_run(left_wrist, T_pregrasp, q_current)[7:]
-
-        self.hand_r.grip(0.1)   # abre mão
-        self.move_joints(right_pregrasp, duration=3.0)
-        time.sleep(1.0)
-        self.comms.report_status(Status.RUNNING, reason='pregrasp_done', progress=0.5)
-
-        # grasp final — começa do pré-grasp
-        q_at_pregrasp = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
-        right_grasp   = self._solve_ik_run(left_wrist, T_obj, q_at_pregrasp)[7:]
-
-        self.move_joints(right_grasp, duration=6.0)
-        time.sleep(0.5)
-
-        self.hand_r.grip(0.8)   # fecha mão
-        time.sleep(0.8)
-
-        self.comms.report_status(Status.RUNNING, reason='grasp_done', progress=0.7)
-        self.estado = STATE_LIFT
-
-    def _do_lift(self):
-        """Estado 2 — levanta o braço. Mão permanece fechada."""
-        log.info('[Estado 2] LIFT')
-        self.comms.report_status(Status.RUNNING, reason='lifting', progress=0.8)
-
-        self.move_joints(MovementConfigs.RightArmUP2Position, duration=2.5)
-
-        self.comms.report_status(Status.DONE, reason='lift_done', progress=1.0)
-        # Para aqui — aguarda comando 'carry' ou 'deliver'
-        self.estado = STATE_IDLE
-
-    def _do_carry(self):
-        """Estado 3 — braço em posição neutra de transporte. Mão fechada."""
-        log.info('[Estado 3] CARRY')
-        self.comms.report_status(Status.RUNNING, reason='carry', progress=0.1)
-
-        self.move_joints(MovementConfigs.ArmCarryPosition, duration=2.0)
-
-        self.comms.report_status(Status.DONE, reason='carry_done', progress=1.0)
-        # Para aqui — aguarda comando 'deliver' ou 'drop'
-        self.estado = STATE_IDLE
-
-    def _do_delivering(self):
-        """Estado 4 — estica braço para frente e abre garra para entregar."""
-        log.info('[Estado 4] DELIVERING')
-        self.comms.report_status(Status.RUNNING, reason='delivering', progress=0.1)
-
-        self.move_joints(MovementConfigs.ArmGivingPosition, duration=3.0)
-
-        # Abre garra para a pessoa receber o objeto
-        self.hand_r.grip(0.1)
-        time.sleep(1.0)
-
-        self.comms.report_status(Status.DONE, reason='deliver_done', progress=1.0)
-        # Para aqui — aguarda comando 'drop' (largar de vez) ou novo grasp
-        self.estado = STATE_IDLE
-
-    def _do_dropping(self):
-        """Estado 5 — abre mão imediatamente (drop de emergência/erro)."""
-        log.info('[Estado 5] DROPPING')
-        self.comms.report_status(Status.RUNNING, reason='dropping', progress=0.1)
-
-        self.hand_r.grip(0.1)
-        time.sleep(0.5)   # mais rápido que o releasing normal
-
-        self.move_joints(MovementConfigs.ArmStandardPosition, duration=2.0)
-
-        self.comms.report_status(Status.DONE, reason='drop_done', progress=1.0)
-        self.estado = STATE_IDLE
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Loop de controlo principal (50 Hz)
-    # ─────────────────────────────────────────────────────────────────────────
     def My_Control(self):
         self.time_ += self.control_dt_
+        K = 18
+        #print(self.time_)
 
-        # ── Inicialização única (primeiro ciclo) ──────────────────────────
+
+        # ---------------------------------------------------------------------
+        # isto só corre da primeira vez
+        # gravar pose da waist ANTES de ativar o modo arm_sdk
         if self.waist_init is None:
-            self.waist_init = [0, 0, 0]   # cintura bloqueada a zero
-            self.left_init  = [self.low_state.motor_state[j].q for j in range(15, 22)]
-            self.right_init = [self.low_state.motor_state[j].q for j in range(22, 29)]
+            self.waist_init = [self.low_state.motor_state[j].q for j in [12,13,14]]
+            #print("Captured waist init:", self.waist_init)
 
-            self.low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q = 1   # activa arm_sdk
+            self.left_init = [self.low_state.motor_state[j].q for j in [15,16,17,18,19,20,21]]
+            #print("Captured left arm init:", self.left_init)
 
-            for idx, j in enumerate(range(22, 29)):
-                self._set_joint(j, self.right_init[idx], kp=200, kd=10)
-            self._fix_left_arm()
-            self._fix_waist()
-            self._flush()
-            log.info('arm_sdk activado; poses iniciais gravadas')
-            return
+            self.right_init = [self.low_state.motor_state[j].q for j in [22,23,24,25,26,27,28]]
+            #print("Captured right arm init:", self.right_init)
 
-        # ── Aceitar comandos DDS apenas quando IDLE ───────────────────────
-        if self.estado == STATE_IDLE:
-            cmd = self.comms.take_cmd()
-            if cmd is not None:
-                self._handle_command(cmd)
+            # aqui está o ponto importante: ativar o arm_sdk
+            self.low_cmd.motor_cmd[G1JointIndex.kNotUsedJoint].q =  1 # 1:Enable arm_sdk, 0:Disable arm_sdk
 
-        # ── Máquina de estados ────────────────────────────────────────────
-        if   self.estado == STATE_INIT_POS:
-            self._do_init_position()
-        elif self.estado == STATE_GRASPING:
-            self._do_grasping()
-        elif self.estado == STATE_LIFT:
-            self._do_lift()
-        elif self.estado == STATE_CARRY:
-            self._do_carry()
-        elif self.estado == STATE_DELIVERING:
-            self._do_delivering()
-        elif self.estado == STATE_DROPPING:
-            self._do_dropping()
+            # manter braço direito rígido na pose inicial
+            # copiar braço right
+            for idx, j in enumerate([22,23,24,25,26,27,28]):
+                  self.low_cmd.motor_cmd[j].q  = self.right_init[idx]
+                  self.low_cmd.motor_cmd[j].dq = 0.0
+                  self.low_cmd.motor_cmd[j].kp = 200
+                  self.low_cmd.motor_cmd[j].kd = 10
+                  self.low_cmd.motor_cmd[j].tau = 0.0
+            # mostra a pose direito arm inicial
+            #for j in [22,23,24,25,26,27,28]:
+            #        s = self.low_state.motor_state[j]
+            #        print(f"right arm Joint {j}: q={s.q:.4f}, dq={s.dq:.4f}, tau_est={s.tau_est:.4f}")
 
-        # ── Manter cintura e braço esquerdo fixos em todos os estados ─────
-        self._fix_waist()
-        self._fix_left_arm()
-        self._flush()
+            # manter braço esquerdo rígido na pose inicial
+            # copiar braço esquerdo
+            for idx, j in enumerate([15,16,17,18,19,20,21]):
+                  self.low_cmd.motor_cmd[j].q  = self.left_init[idx]
+                  self.low_cmd.motor_cmd[j].dq = 0.0
+                  self.low_cmd.motor_cmd[j].kp = 200
+                  self.low_cmd.motor_cmd[j].kd = 10
+                  self.low_cmd.motor_cmd[j].tau = 0.0
+            # mostra a pose left arm inicial
+            #for j in [15,16,17,18,19,20,21]:
+            #        s = self.low_state.motor_state[j]
+            #        print(f"left arm Joint {j}: q={s.q:.4f}, dq={s.dq:.4f}, tau_est={s.tau_est:.4f}")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Despacho de comandos DDS
-    # ─────────────────────────────────────────────────────────────────────────
-    def _handle_command(self, cmd: GraspCommand):
-        """
-        Semântica do objeto_id:
-          ''         → apanhar o objeto indicado em cmd.objeto (usa cmd.pose)
-          'carry'    → modo transporte, braço neutro
-          'deliver'  → entregar à pessoa, abre garra
-          'drop'     → largar imediatamente (recuperação de erro)
-          'shutdown' → desligar o script
-        """
-        log.info('Comando: postura=%s objeto="%s" objeto_id="%s"',
-                 cmd.postura, cmd.objeto, cmd.objeto_id)
-
-        # ── shutdown — tratado antes de qualquer outra coisa ──────────────
-        if cmd.objeto_id == 'shutdown':
-            log.info('Shutdown recebido — a terminar')
-            self.comms.report_status(Status.DONE, reason='shutdown')
-            self.done = True
-            return
-
-        # ── drop — funciona em qualquer postura, prioridade alta ──────────
-        if cmd.objeto_id == 'drop':
-            self.comms.report_status(Status.RUNNING, reason='drop_started', progress=0.0)
-            self.estado = STATE_DROPPING
-            return
-
-        # ── comandos dependentes da postura ───────────────────────────────
-        if cmd.postura == Posture.EXTEND_ARM_FORWARD:
-
-            if cmd.objeto_id == '':
-                # apanhar objeto — pose vem em cmd.pose (Pose6DOF)
-                try:
-                    self.target_object_pose = self._pose6dof_to_SE3(cmd.pose)
-                    log.info('Pose do objeto: x=%.3f y=%.3f z=%.3f r=%.3f p=%.3f y=%.3f',
-                             cmd.pose.x, cmd.pose.y, cmd.pose.z,
-                             cmd.pose.roll, cmd.pose.pitch, cmd.pose.yaw)
-                except Exception as e:
-                    log.error('Erro ao ler pose: %s', e)
-                    self.comms.report_status(Status.ERROR, reason=f'bad_pose:{e}')
-                    return
-                self.comms.report_status(Status.RUNNING, reason='grasp_started', progress=0.0)
-                self.estado = STATE_INIT_POS
-
-            elif cmd.objeto_id == 'carry':
-                self.comms.report_status(Status.RUNNING, reason='carry_started', progress=0.0)
-                self.estado = STATE_CARRY
-
-            elif cmd.objeto_id == 'deliver':
-                self.comms.report_status(Status.RUNNING, reason='deliver_started', progress=0.0)
-                self.estado = STATE_DELIVERING
-
-            else:
-                log.warning('objeto_id desconhecido: "%s"', cmd.objeto_id)
-                self.comms.report_status(Status.ERROR, reason=f'unknown_id:{cmd.objeto_id}')
-
-        elif cmd.postura == Posture.NEUTRAL:
-            # NEUTRAL sem objeto_id especial — não faz nada (drop já tratado acima)
-            log.warning('NEUTRAL recebido sem objeto_id reconhecido (usa drop para largar)')
-            self.comms.report_status(Status.ERROR, reason='neutral_no_action')
-
-        else:
-            log.warning('Postura desconhecida: %s', cmd.postura)
-            self.comms.report_status(Status.ERROR, reason=f'unknown_posture:{cmd.postura}')
+            # manter as 3 waist joints iguais à posição inicial
+            self.fixa_waist()
+        # ---------------------------------------------------------------------
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ponto de entrada
-# ─────────────────────────────────────────────────────────────────────────────
+
+        # mostra a pose da waist
+        #for j in [12, 13, 14]:
+        #        s = self.low_state.motor_state[j]
+        #        print(f"waist Joint {j}: q={s.q:.4f}, dq={s.dq:.4f}, tau_est={s.tau_est:.4f}")
+
+
+        #print(f"self.estado={self.estado }" )
+
+        if self.estado==0:
+            # Mover os braços para posição inicial
+            Move = MovementConfigs.ArmStandardPosition
+            self.move_joints(Move)
+            self.next_state()
+            time.sleep(2)
+
+        elif self.estado==1:
+            # ─── 1. Pose do objeto (recebes da câmara) ─────────────────────
+            # T_base_obj já transformada (câmara → base)
+            # Assumindo que já tens isto calculado antes
+            self.target_object_pose = self._pose_to_SE3([np.float64(0.083), np.float64(-0.066), np.float64(0.468), 7.15, -14.5, -25.14])
+            self.T_base_obj = self.target_object_pose  # 4x4 np.ndarray
+
+            # ─── 2. Calcula pré-grasp (sobe no Z do mundo) ─────────────────
+            T_pregrasp = self.T_base_obj.copy()
+            T_pregrasp[:3, 3] += np.array([0.0, 0.0, 0.15])  # 15cm acima
+
+            # ─── 3. IK para pré-grasp ──────────────────────────────────────
+            self.left_wrist = np.eye(4)  # braço esquerdo parado
+            q_current = [self.low_state.motor_state[j].q for j in range(15, 29)]
+
+            pregrasp_joints = self._solve_ik_run(
+                self.left_wrist,
+                T_pregrasp,
+                current_q=np.array(q_current)
+            )
+            right_pregrasp = pregrasp_joints[7:]  # só braço direito
+            self.pregrasp = right_pregrasp
+            sla = input("Clica enter se ta tudo bem, agora vem o pregrasp prepara para o desastre")
+            self.next_state()
+
+        elif self.estado==2:
+            print('AQUI VAI!!!')
+            # ─── 4. Move para pré-grasp ────────────────────────────────────
+            self.hand_r.grip(0.1)  # abre mão antes de mover
+            self.move_joints(self.pregrasp)
+            time.sleep(1)
+
+            sla = input('Clica enter para ver se ta tudo bem, Calculo do IK grasp')
+            self.next_state()
+        elif self.estado==3:
+            print('Calma agora matemática brinca')
+            # ─── 5. IK para grasp (parte do pré-grasp!) ────────────────────
+            q_at_pregrasp = [self.low_state.motor_state[j].q for j in range(15, 29)]
+
+
+            T_grasp = self.T_base_obj.copy()
+            T_grasp[:3, 3] += np.array([0.0, 0.0, 0.06])  # 15cm acima
+
+            grasp_joints = self._solve_ik_run(
+                self.left_wrist,
+                T_grasp,
+                current_q=np.array(q_at_pregrasp)  # começa perto!
+            )
+            right_grasp = grasp_joints[7:]
+            self.grasp = right_grasp
+            sla = input('Clica enter para ver se ta tudo bem, agora vai o grasp')
+            self.next_state()
+        elif  self.estado==4:
+            print('AQUI VAI!!! AGAINNNNN!!!')
+            # ─── 6. Desce devagar para o objeto ────────────────────────────
+            self.move_joints(self.grasp, duration=3.0)  # mais lento
+            time.sleep(0.5)
+
+            # ─── 7. Fecha mão ──────────────────────────────────────────────
+            self.hand_r.grip(0.6)
+            time.sleep(0.8)  # deixa estabilizar
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==5:
+            Move = MovementConfigs.RightArmUP2Position
+            self.move_joints(Move)
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==6:
+            Move2 = MovementConfigs.ArmCarryPosition
+            self.move_joints(Move2)
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==7:
+            Move3 = MovementConfigs.ArmGivingPosition
+            self.move_joints(Move3)
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==8:
+            # Levantar o braço
+            
+            Move4 = MovementConfigs.ArmStandardPosition
+            self.move_joints(Move4)
+            self.hand_r.stop()
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+            time.sleep(2)
+
+            print("Done!!")
+
+
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.arm_sdk_publisher.Write(self.low_cmd)
+
+
 if __name__ == '__main__':
-    print('AVISO: Certifica-te de que não há obstáculos à volta do robô.')
-    input('Pressiona Enter para continuar...\n')
 
-    ChannelFactoryInitialize(0, 'enp117s0')
+    print("WARNING: Please ensure there are no obstacles around the robot while running this example.")
+    input("Press Enter to continue...")
+
+    ChannelFactoryInitialize(0, "enp117s0")
 
     custom = Custom()
     custom.Init()
     custom.Start()
 
-    log.info('Controlador em execução. À espera de comandos DDS em rt/grasp/command ...')
 
-    try:
-        while True:
-            time.sleep(1.0)
-            if custom.done:
-                log.info('Done flag activa — a sair')
-                sys.exit(0)
-    except KeyboardInterrupt:
-        log.info('Interrompido pelo utilizador')
-        sys.exit(0)
+    while True:
+        time.sleep(1)
+        if custom.done:
+           print("Done!")
+           sys.exit(-1)
 
 
 '''
