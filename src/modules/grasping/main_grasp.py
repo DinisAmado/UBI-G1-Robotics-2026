@@ -400,7 +400,7 @@ class Custom:
         """Estado 1 — IK pré-grasp → desce → fecha mão."""
         if self.target_object_pose is None:
             log.error('[Estado 1] target_object_pose não definida — abortar')
-            self.comms.report_status(Status.ERROR, reason='no_object_pose')
+            self.comms.report_status(Status.FAILED, reason='no_object_pose')
             self.estado = STATE_IDLE
             return
 
@@ -572,7 +572,7 @@ class Custom:
                              cmd.pose.roll, cmd.pose.pitch, cmd.pose.yaw)
                 except Exception as e:
                     log.error('Erro ao ler pose: %s', e)
-                    self.comms.report_status(Status.ERROR, reason=f'bad_pose:{e}')
+                    self.comms.report_status(Status.FAILED, reason=f'bad_pose:{e}')
                     return
                 self.comms.report_status(Status.RUNNING, reason='grasp_started', progress=0.0)
                 self.estado = STATE_INIT_POS
@@ -587,16 +587,16 @@ class Custom:
 
             else:
                 log.warning('objeto_id desconhecido: "%s"', cmd.objeto_id)
-                self.comms.report_status(Status.ERROR, reason=f'unknown_id:{cmd.objeto_id}')
+                self.comms.report_status(Status.FAILED, reason=f'unknown_id:{cmd.objeto_id}')
 
         elif cmd.postura == Posture.NEUTRAL:
             # NEUTRAL sem objeto_id especial — não faz nada (drop já tratado acima)
             log.warning('NEUTRAL recebido sem objeto_id reconhecido (usa drop para largar)')
-            self.comms.report_status(Status.ERROR, reason='neutral_no_action')
+            self.comms.report_status(Status.FAILED, reason='neutral_no_action')
 
         else:
             log.warning('Postura desconhecida: %s', cmd.postura)
-            self.comms.report_status(Status.ERROR, reason=f'unknown_posture:{cmd.postura}')
+            self.comms.report_status(Status.FAILED, reason=f'unknown_posture:{cmd.postura}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -623,28 +623,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         log.info('Interrompido pelo utilizador')
         sys.exit(0)
-
-
-'''
-Captured waist init: [0.0016873788554221392, -0.00022736095706932247, -0.0013243765570223331]
-Captured left arm init: [0.2964298129081726, 0.21361801028251648, -0.026976490393280983, 0.9903164505958557, 0.12208329886198044, 0.05655355751514435, 0.002672482281923294]
-Captured right arm init: [0.29491978883743286, -0.21790838241577148, 0.01973801851272583, 0.9893936514854431, -0.14285196363925934, 0.056589510291814804, 0.004877579864114523]
-waist Joint 12: q=0.0017, dq=-0.0034, tau_est=-0.2797
-waist Joint 13: q=-0.0002, dq=-0.0029, tau_est=0.0000
-waist Joint 14: q=-0.0013, dq=-0.0043, tau_est=1.0847
-right arm Joint 22: q=0.2949, dq=0.0000, tau_est=0.5625
-right arm Joint 23: q=-0.2179, dq=0.0123, tau_est=-2.5000
-right arm Joint 24: q=0.0197, dq=0.0000, tau_est=-0.2500
-right arm Joint 25: q=0.9894, dq=0.0077, tau_est=-1.0000
-right arm Joint 26: q=-0.1429, dq=0.0031, tau_est=-0.1875
-right arm Joint 27: q=0.0566, dq=0.0061, tau_est=-0.1937
-right arm Joint 28: q=0.0049, dq=0.0000, tau_est=0.0188
-left arm Joint 15: q=0.2964, dq=0.0077, tau_est=0.1875
-left arm Joint 16: q=0.2136, dq=0.0000, tau_est=2.5625
-left arm Joint 17: q=-0.0270, dq=0.0015, tau_est=0.6250
-left arm Joint 18: q=0.9903, dq=0.0031, tau_est=-1.3750
-left arm Joint 19: q=0.1221, dq=-0.0077, tau_est=0.0000
-left arm Joint 20: q=0.0566, dq=0.0000, tau_est=-0.2562
-left arm Joint 21: q=0.0027, dq=0.0000, tau_est=-0.0312
-
-'''

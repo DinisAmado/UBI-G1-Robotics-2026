@@ -339,13 +339,13 @@ class Orchestrator:
         if sample.status == Status.DONE:
 
             if self._phase == Phase.GRASPING_OBJECT:
-                # Objeto agarrado — braço em postura de transporte
+                # Objeto agarrado — braço em postura de transporte (mão fechada)
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto=self._ctx.last_object_name,
                     objeto_id="carry",
                     pose=Pose6DOF(),
-                    postura=Posture.NEUTRAL,
+                    postura=Posture.EXTEND_ARM_FORWARD,
                 ))
 
                 # Navega até à pessoa identificada pelos lábios
@@ -361,8 +361,16 @@ class Orchestrator:
                                        "pessoa não encontrada no SLAM")
 
             elif self._phase == Phase.DELIVERING:
-                # Entrega concluída
-                log.info("Entrega concluída com sucesso!")
+                # Braço estendido — enviar comando para abrir a mão e retrair o braço
+                self._w_grasp_cmd.write(GraspCommand(
+                    header=self._make_header(),
+                    objeto=self._ctx.last_object_name,
+                    objeto_id="drop",
+                    pose=Pose6DOF(),
+                    postura=Posture.NEUTRAL,
+                ))
+                log.info("Objeto '%s' entregue — a abrir mão e retrair braço",
+                         self._ctx.last_object_name)
                 self._ctx.retry_counts = {p: 0 for p in Phase}
                 self._transition(Phase.IDLE, "tarefa concluída")
 
