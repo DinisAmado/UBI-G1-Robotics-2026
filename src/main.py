@@ -298,10 +298,7 @@ class Orchestrator:
                 self._ctx.last_object_pose = det.pose
                 log.info("Objecto '%s' localizado (conf=%.2f)", det.name, det.confidence)
 
-                self._w_nav_goal.write(Goal(
-                    header=self._make_header(),
-                    data=GoalData(GoalType.NAMED, TABLE_LOCATION_NAME),
-                ))
+                self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
                 self._transition(Phase.NAVIGATING_TO_TABLE,
                                  f"a navegar para '{TABLE_LOCATION_NAME}'")
                 return
@@ -466,14 +463,20 @@ class Orchestrator:
         if self._ctx.known_locations:
             for loc in self._ctx.known_locations.locations:
                 if loc.name == self._ctx.last_person_id:
-                    return Goal(
-                        header=self._make_header(),
-                        data=GoalData(GoalType.NAMED, loc.name),
-                    )
+                    return self._make_named_goal(loc.name)
 
         log.warning("Pessoa '%s' não encontrada nas localizações SLAM.",
                     self._ctx.last_person_id)
         return None
+
+    def _make_named_goal(self, name: str) -> Goal:
+        """Cria um NavGoal do tipo NAMED.
+        IdlUnion não aceita argumentos no construtor — o discriminador é
+        definido atribuindo o campo após a criação da instância vazia.
+        """
+        data = GoalData()
+        data.name = name
+        return Goal(header=self._make_header(), data=data)
 
     def _make_header(self) -> Header:
         with self._lock:
