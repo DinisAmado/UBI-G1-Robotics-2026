@@ -470,12 +470,7 @@ class Orchestrator:
         return None
 
     def _make_named_goal(self, name: str) -> Goal:
-        """Cria um NavGoal do tipo NAMED.
-        IdlUnion não aceita argumentos no construtor — o discriminador é
-        definido atribuindo o campo após a criação da instância vazia.
-        """
-        data = GoalData()
-        data.name = name
+        data = GoalData(name=name)
         return Goal(header=self._make_header(), data=data)
 
     def _make_header(self) -> Header:
