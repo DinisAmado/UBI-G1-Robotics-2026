@@ -111,6 +111,11 @@ MAX_LINEAR_SPEED = 0.15
 MAX_ANGULAR_SPEED = 0.30
 YAW_ALIGN_THRESHOLD = 0.35
 
+# Failsafe
+ODOM_TIMEOUT_S = 1.0
+CMD_ZERO_BURST_COUNT = 3
+SAFE_STATUS_INTERVAL_S = 0.5
+
 # Localizações temporárias para objetivos nomeados.
 # Mais tarde podem ser substituídas por dados reais vindos da orquestração/visão.
 KNOWN_LOCATIONS = {
@@ -149,7 +154,7 @@ class NavigationModule:
         self.current_waypoint_index = 0
         self.navigation_active = False
 
-        # Estado vindo da orquestração e da visão
+        # Estado vindo da orquestração e da visão.
         self.current_phase = Phase.IDLE
         self.target_person_id = ""
         self.latest_persons = None
@@ -160,6 +165,12 @@ class NavigationModule:
         self.last_status_time = 0.0
         self.last_orch_log_time = 0.0
         self.last_vision_log_time = 0.0
+
+        # Failsafe.
+        self.last_odom_time = 0.0
+        self.last_safe_stop_reason = ""
+        self.last_safe_stop_log_time = 0.0
+        self.orchestration_allows_navigation = True
 
         self.slam = SLAMNavigation(
             map_size=MAP_SIZE,
@@ -314,6 +325,27 @@ class NavigationModule:
     def stop_robot(self):
         self.send_cmd_vel(0.0, 0.0, 0.0)
 
+    def safe_stop(self, reason="Paragem de segurança", publish_status=False):
+        """
+        Failsafe principal.
+
+        Sempre que houver problema, chama esta função para publicar cmd_vel = 0.
+        Em situações críticas, envia várias mensagens zero seguidas para aumentar
+        a probabilidade de o módulo de movimento receber a paragem.
+        """
+        for _ in range(CMD_ZERO_BURST_COUNT):
+            self.stop_robot()
+
+        now = time.time()
+
+        if reason != self.last_safe_stop_reason or now - self.last_safe_stop_log_time >= SAFE_STATUS_INTERVAL_S:
+            log.warning("[SAFE STOP] %s", reason)
+            self.last_safe_stop_reason = reason
+            self.last_safe_stop_log_time = now
+
+            if publish_status:
+                self.publish_status(Status.FAILED, reason, 0.0)
+
     # ==========================================================================
     # LEITURAS DDS
     # ==========================================================================
@@ -341,6 +373,7 @@ class NavigationModule:
     def update_orchestration_state(self, state: OrchestratorState):
         """
         Atualiza a fase atual e a pessoa alvo vinda da orquestração.
+        Também usa active_modules.navigation como condição de segurança.
         """
 
         previous_phase = self.current_phase
@@ -348,6 +381,13 @@ class NavigationModule:
 
         self.current_phase = state.phase
         self.target_person_id = state.current_target_person
+        self.orchestration_allows_navigation = bool(state.active_modules.navigation)
+
+        if not self.orchestration_allows_navigation:
+            self.navigation_active = False
+            self.current_path = []
+            self.current_waypoint_index = 0
+            self.safe_stop("Orquestração desativou navigation")
 
         now = time.time()
         changed = (
@@ -435,6 +475,7 @@ class NavigationModule:
 
     def update_odometry(self, odom: OdometryMsg):
         self.current_pose = odom.pose
+        self.last_odom_time = time.time()
 
         q = self.current_pose.orientation
         self.current_yaw = yaw_from_quaternion(q.x, q.y, q.z, q.w)
@@ -445,6 +486,22 @@ class NavigationModule:
         )
 
         self.slam.update_pose(cell_x, cell_y, self.current_yaw)
+
+    def odometry_is_recent(self):
+        """
+        Verifica se há odometria recente.
+
+        Enquanto ENABLE_MOTION=False, a ausência de odometria não bloqueia testes DDS,
+        porque o robô não vai mover-se. Quando ENABLE_MOTION=True, a odometria passa
+        a ser obrigatória para enviar velocidades diferentes de zero.
+        """
+        if not ENABLE_MOTION:
+            return True
+
+        if self.last_odom_time <= 0.0:
+            return False
+
+        return (time.time() - self.last_odom_time) <= ODOM_TIMEOUT_S
 
     # ==========================================================================
     # OBJETIVOS E PLANEAMENTO
@@ -458,7 +515,6 @@ class NavigationModule:
         Se for POSE, usa a pose enviada.
         """
 
-        # Tentar objetivo nomeado.
         try:
             name = goal.data.name
 
@@ -472,7 +528,6 @@ class NavigationModule:
         except Exception:
             pass
 
-        # Tentar objetivo por pose.
         try:
             return goal.data.pose
         except Exception:
@@ -489,6 +544,13 @@ class NavigationModule:
         return self.slam.plan_path(goal_cell, allow_unknown=True)
 
     def handle_new_goal(self, goal: NavGoal):
+        if not self.orchestration_allows_navigation:
+            self.navigation_active = False
+            self.current_path = []
+            self.current_waypoint_index = 0
+            self.safe_stop("Goal recebido, mas navigation está desativado pela orquestração")
+            return
+
         self.current_goal = goal
         self.current_goal_pose = self.get_goal_pose(goal)
 
@@ -498,8 +560,7 @@ class NavigationModule:
             self.current_path = []
             self.current_waypoint_index = 0
             self.navigation_active = False
-            self.stop_robot()
-            self.publish_status(Status.FAILED, "Objetivo inválido", 0.0)
+            self.safe_stop("Objetivo inválido", publish_status=True)
             return
 
         self.current_path = self.plan_path(self.current_goal_pose)
@@ -507,8 +568,7 @@ class NavigationModule:
 
         if not self.current_path:
             self.navigation_active = False
-            self.stop_robot()
-            self.publish_status(Status.FAILED, "Não foi possível planear caminho", 0.0)
+            self.safe_stop("Não foi possível planear caminho", publish_status=True)
             return
 
         self.navigation_active = True
@@ -529,11 +589,11 @@ class NavigationModule:
         """
 
         if not self.current_path:
-            self.stop_robot()
+            self.safe_stop("Sem caminho para seguir")
             return 0.0
 
         if self.current_waypoint_index >= len(self.current_path):
-            self.stop_robot()
+            self.safe_stop("Índice do waypoint fora do caminho")
             return 1.0
 
         target_cell = self.current_path[self.current_waypoint_index]
@@ -551,7 +611,7 @@ class NavigationModule:
             self.current_waypoint_index += 1
 
             if self.current_waypoint_index >= len(self.current_path):
-                self.stop_robot()
+                self.safe_stop("Último waypoint atingido")
                 return 1.0
 
             target_cell = self.current_path[self.current_waypoint_index]
@@ -579,8 +639,23 @@ class NavigationModule:
         return max(0.0, min(1.0, progress))
 
     def update_navigation(self):
+        if not self.orchestration_allows_navigation:
+            self.navigation_active = False
+            self.safe_stop("Navigation desativado pela orquestração")
+            return
+
+        if not self.odometry_is_recent():
+            self.navigation_active = False
+            self.safe_stop("Odometria ausente ou desatualizada", publish_status=True)
+            return
+
         if not self.navigation_active or self.current_goal_pose is None:
-            self.stop_robot()
+            self.safe_stop("Sem navegação ativa")
+            return
+
+        if not self.current_path:
+            self.navigation_active = False
+            self.safe_stop("Sem caminho ativo", publish_status=True)
             return
 
         dist = self.distance_to_goal(self.current_goal_pose)
@@ -589,7 +664,7 @@ class NavigationModule:
             self.navigation_active = False
             self.current_path = []
             self.current_waypoint_index = 0
-            self.stop_robot()
+            self.safe_stop("Objetivo alcançado")
             self.publish_status(Status.DONE, "Objetivo alcançado", 1.0)
             return
 
@@ -597,14 +672,11 @@ class NavigationModule:
             self.navigation_active = False
             self.current_path = []
             self.current_waypoint_index = 0
-            self.stop_robot()
-            self.publish_status(Status.FAILED, "Caminho ficou inválido", 0.0)
+            self.safe_stop("Caminho ficou inválido", publish_status=True)
             return
 
-        # Por segurança, ainda não enviamos velocidades reais.
-        # O motion só recebe zeros até ENABLE_MOTION=True.
         if not ENABLE_MOTION:
-            self.stop_robot()
+            self.safe_stop("Movimento desativado por segurança")
             progress = max(0.0, min(1.0, 1.0 - dist / 4.0))
 
             now = time.time()
@@ -638,48 +710,49 @@ class NavigationModule:
 
         self.publish_locations()
         self.publish_status(Status.DONE, "Módulo de navegação iniciado", 0.0)
-        self.stop_robot()
+        self.safe_stop("Arranque do módulo")
 
         try:
             while True:
                 now = time.time()
 
-                # 1. Ler odometria do motion
                 odom = self.poll_odometry()
                 if odom:
                     self.update_odometry(odom)
 
-                # 2. Ler estado da orquestração
                 orch_state = self.poll_orchestration_state()
                 if orch_state:
                     self.update_orchestration_state(orch_state)
 
-                # 3. Ler deteções de pessoas da visão
                 persons = self.poll_persons()
                 if persons:
                     self.update_persons(persons)
 
-                # 4. Publicar pose SLAM a 50 Hz
                 self.publish_pose()
 
-                # 5. Publicar localizações periodicamente
                 if now - self.last_locations_time >= 5.0:
                     self.publish_locations()
                     self.last_locations_time = now
 
-                # 6. Ler novo objetivo
                 goal = self.poll_goal()
                 if goal:
                     self.handle_new_goal(goal)
 
-                # 7. Atualizar navegação
                 self.update_navigation()
 
                 time.sleep(LOOP_DT)
 
         except KeyboardInterrupt:
             log.info("Encerramento manual. A parar robô.")
-            self.stop_robot()
+            self.safe_stop("Encerramento manual")
+
+        except Exception as e:
+            log.exception("Erro inesperado no módulo de navegação: %s", e)
+            self.safe_stop(f"Erro inesperado: {e}", publish_status=True)
+            raise
+
+        finally:
+            self.safe_stop("Saída do programa")
 
 
 # ==============================================================================
