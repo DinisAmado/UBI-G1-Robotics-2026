@@ -50,6 +50,7 @@ from navigation import (
     reached_goal,
 )
 
+
 # ---------------------------------------------------------------
 # Configurações do mapa
 # ---------------------------------------------------------------
@@ -101,8 +102,8 @@ def is_goal_cell_usable(slam, x, y):
     """
     Verifica se uma célula pode ser usada como objetivo.
 
-    Para já aceitamos células livres ou desconhecidas, desde que não estejam ocupadas.
-    Isto é útil porque o mapa local pode ter zonas ainda não totalmente observadas.
+    Para já aceitamos células livres ou desconhecidas,
+    desde que não estejam ocupadas.
     """
     if not (0 <= x < slam.map_size and 0 <= y < slam.map_size):
         return False
@@ -115,10 +116,8 @@ def is_goal_cell_usable(slam, x, y):
 
 def find_nearby_free_goal(slam, desired_goal, robot_cell, search_radius_m=0.35):
     """
-    Se o ponto de paragem calculado não for válido, procura uma célula livre/desocupada
-    próxima desse ponto.
-
-    Escolhe a célula mais próxima do ponto desejado e, em empate, a mais próxima do robô.
+    Se o ponto de paragem calculado não for válido, procura uma célula
+    livre/desocupada próxima desse ponto.
     """
     gx, gy = desired_goal
     rx, ry = robot_cell
@@ -162,19 +161,8 @@ def find_nearest_front_obstacle_goal(
     search_radius_m=0.35
 ):
     """
-    Encontra automaticamente um objetivo local perto do obstáculo frontal mais próximo.
-
-    Lógica:
-    1. procura células ocupadas na occupancy grid;
-    2. filtra apenas obstáculos à frente do robô, dentro de um cone frontal;
-    3. escolhe o obstáculo mais próximo;
-    4. cria um objetivo 30 cm antes desse obstáculo;
-    5. se o objetivo não for utilizável, procura uma célula livre próxima.
-
-    Isto serve para o cenário:
-        robô -> mesa -> pessoas
-
-    Como a mesa é o obstáculo frontal mais próximo, o robô escolhe parar antes dela.
+    Encontra automaticamente um objetivo local perto do obstáculo frontal
+    mais próximo.
     """
     rx, ry = robot_cell
 
@@ -185,7 +173,6 @@ def find_nearest_front_obstacle_goal(
     half_angle_rad = math.radians(front_angle_deg / 2.0)
 
     # Direção "frente" no referencial da grelha.
-    # No teu código, x da grelha corresponde ao eixo vertical e y ao horizontal.
     forward_x = math.cos(robot_yaw)
     forward_y = math.sin(robot_yaw)
 
@@ -211,7 +198,7 @@ def find_nearest_front_obstacle_goal(
             if dist < min_cells or dist > max_cells:
                 continue
 
-            # Ângulo entre a direção do robô e a direção para o obstáculo
+            # Ângulo entre a direção do robô e a direção para o obstáculo.
             dot = (vx * forward_x + vy * forward_y) / dist
             dot = max(-1.0, min(1.0, dot))
             angle_to_forward = math.acos(dot)
@@ -228,7 +215,7 @@ def find_nearest_front_obstacle_goal(
 
     ox, oy = best_obstacle
 
-    # Vetor unitário do robô para o obstáculo
+    # Vetor unitário do robô para o obstáculo.
     vx = ox - rx
     vy = oy - ry
     dist = math.sqrt(vx * vx + vy * vy)
@@ -239,7 +226,7 @@ def find_nearest_front_obstacle_goal(
     ux = vx / dist
     uy = vy / dist
 
-    # Ponto de paragem: 30 cm antes do obstáculo
+    # Ponto de paragem antes do obstáculo.
     desired_gx = int(round(ox - ux * stop_cells))
     desired_gy = int(round(oy - uy * stop_cells))
 
@@ -332,22 +319,19 @@ class RobotController:
         # ---------------------------------------------------
         # Estado da missão
         # ---------------------------------------------------
-        # Para já, é manual.
-        # Quando a orquestração estiver pronta, isto passa a vir do tópico DDS.
+        # Para testar a mesa:
+        #     mission_phase = "GO_TO_TABLE"
         #
-        # Opções:
-        #   "GO_TO_TABLE"   -> ir até à mesa
-        #   "GO_TO_PERSON"  -> ir até à pessoa
-        #   "DONE"          -> terminado
+        # Para testar a pessoa:
+        #     mission_phase = "GO_TO_PERSON"
         # ---------------------------------------------------
-        
         mission_phase = "GO_TO_TABLE"
-        
+
         current_goal_cell = None
         current_obstacle_cell = None
         current_path = []
         last_replan_time = 0.0
-        
+
         # Valores temporários da visão.
         # Mais tarde estes valores vêm do módulo da visão.
         person_visible = False
@@ -417,12 +401,13 @@ class RobotController:
             # ---------------------------------------------------
             # VISÃO — temporário para testes
             # ---------------------------------------------------
-            # Mais tarde, estes valores vêm do tópico da visão.
-            # Por agora:
-            #   person_visible = True significa que a pessoa foi detetada
-            #   person_offset_x = 0.0 significa que está centrada
+            # Para testar GO_TO_PERSON:
+            #     person_visible = True
+            #     person_offset_x = 0.0
+            #
+            # Para testar pessoa não centrada:
+            #     person_offset_x = 0.5
             # ---------------------------------------------------
-            
             if mission_phase == "GO_TO_PERSON":
                 person_visible = True
                 person_offset_x = 0.0
@@ -468,11 +453,8 @@ class RobotController:
             # ---------------------------------------------------
             # Sensores
             # ---------------------------------------------------
-
             if not real_robot:
-                # ---------------------------------------------------
                 # Simulação: ler dados do MuJoCo
-                # ---------------------------------------------------
                 mujoco_ok, mx, my, myaw, rays = sensor_mujoco_json()
 
                 if mujoco_ok:
@@ -482,9 +464,7 @@ class RobotController:
                     slam.update_from_mujoco_rays(rays)
 
             else:
-                # ---------------------------------------------------
                 # Robô real: ler point cloud do Livox
-                # ---------------------------------------------------
                 curr_cell_x, curr_cell_y = world_to_cell(self.pos_x, self.pos_y)
 
                 now_debug = time.time()
@@ -546,7 +526,7 @@ class RobotController:
                 # - passou algum tempo desde o último replaneamento.
                 #
                 # Em modo local, isto ajuda porque o mapa muda muito com o LiDAR.
-                                path_needs_replan = (
+                path_needs_replan = (
                     not current_path
                     or not slam.is_path_valid(current_path)
                     or (now - last_replan_time >= REPLAN_INTERVAL_S)
@@ -636,8 +616,14 @@ class RobotController:
                     if current_goal_cell is not None and current_obstacle_cell is not None:
                         gx, gy = current_goal_cell
                         ox, oy = current_obstacle_cell
-                        dist_obs_m = math.sqrt((ox - curr_cell_x) ** 2 + (oy - curr_cell_y) ** 2) * MAP_RESOLUTION
-                        dist_goal_m = math.sqrt((gx - curr_cell_x) ** 2 + (gy - curr_cell_y) ** 2) * MAP_RESOLUTION
+
+                        dist_obs_m = math.sqrt(
+                            (ox - curr_cell_x) ** 2 + (oy - curr_cell_y) ** 2
+                        ) * MAP_RESOLUTION
+
+                        dist_goal_m = math.sqrt(
+                            (gx - curr_cell_x) ** 2 + (gy - curr_cell_y) ** 2
+                        ) * MAP_RESOLUTION
 
                         print(
                             f"FASE={mission_phase} | obstáculo=({ox},{oy}) dist={dist_obs_m:.2f} m | "
@@ -657,9 +643,7 @@ class RobotController:
 
                 robot_dot.set_data([curr_cell_y], [curr_cell_x])
 
-                arrow_len = 10  # comprimento da seta em células
-                # eixo horizontal = cell_y
-                # eixo vertical   = cell_x
+                arrow_len = 10
                 arrow_dx = arrow_len * math.sin(yaw)
                 arrow_dy = arrow_len * math.cos(yaw)
 
@@ -732,7 +716,6 @@ class RobotController:
             # ---------------------------------------------------
             # Segurança: por agora não enviar movimento real.
             # Mantemos LowCmd vazio como heartbeat/comunicação.
-            # Para teste totalmente passivo, comenta estas 3 linhas.
             # ---------------------------------------------------
             cmd = unitree_hg_msg_dds__LowCmd_()
             cmd.crc = self.crc.Crc(cmd)
