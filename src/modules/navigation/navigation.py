@@ -4,9 +4,10 @@ Funções auxiliares de navegação usadas pelo módulo SLAM/Navegação.
 
 Este ficheiro contém apenas lógica reutilizável:
 - conversão mundo <-> célula;
-- conversão quaternion -> yaw;
+- conversão quaternion <-> yaw;
 - escolha automática de objetivo antes de obstáculo frontal;
-- procura de célula livre próxima.
+- procura de célula livre próxima;
+- validações simples usadas na mesa e na pessoa.
 
 Não deve conter:
 - Matplotlib;
@@ -29,15 +30,27 @@ MAP_RESOLUTION = 0.05
 
 
 # ---------------------------------------------------------------
-# Configurações da navegação local
+# Configurações da navegação local até à mesa
 # ---------------------------------------------------------------
 
-LOCAL_GOAL_STOP_DISTANCE_M = 0.30       # parar a 30 cm do obstáculo
+LOCAL_GOAL_STOP_DISTANCE_M = 0.30       # parar a 30 cm da mesa/obstáculo
 LOCAL_GOAL_FRONT_ANGLE_DEG = 70         # cone frontal de procura
 LOCAL_GOAL_MIN_DISTANCE_M = 0.45        # ignora obstáculos demasiado perto
 LOCAL_GOAL_MAX_DISTANCE_M = 4.00        # procura até 4 m
 LOCAL_GOAL_SEARCH_RADIUS_M = 0.35       # se o goal cair mal, procura livre à volta
 REPLAN_INTERVAL_S = 1.0                 # recalcula no máximo a cada 1 s
+
+
+# ---------------------------------------------------------------
+# Configurações para navegação até à pessoa
+# ---------------------------------------------------------------
+
+PERSON_CENTER_TOLERANCE = 0.15          # yaw/offset visual considerado centrado
+PERSON_STOP_DISTANCE_M = 0.70           # parar a 70 cm da pessoa
+PERSON_FRONT_ANGLE_DEG = 40             # cone mais apertado porque a pessoa deve estar centrada
+PERSON_MIN_DISTANCE_M = 0.70            # ignora obstáculos demasiado perto
+PERSON_MAX_DISTANCE_M = 4.00
+PERSON_SEARCH_RADIUS_M = 0.35
 
 
 # ---------------------------------------------------------------
@@ -165,7 +178,7 @@ def find_nearest_front_obstacle_goal(
     slam,
     robot_cell,
     robot_yaw,
-    stop_distance_m=0.25,
+    stop_distance_m=0.30,
     front_angle_deg=70,
     min_distance_m=0.45,
     max_distance_m=4.00,
@@ -180,11 +193,6 @@ def find_nearest_front_obstacle_goal(
     3. escolhe o obstáculo mais próximo;
     4. cria um objetivo stop_distance_m antes desse obstáculo;
     5. se o objetivo não for utilizável, procura uma célula livre próxima.
-
-    Cenário esperado:
-        robô -> mesa -> pessoas
-
-    Como a mesa é o obstáculo frontal mais próximo, o robô escolhe parar antes dela.
     """
 
     rx, ry = robot_cell
@@ -210,7 +218,6 @@ def find_nearest_front_obstacle_goal(
 
     for x in range(x_min, x_max + 1):
         for y in range(y_min, y_max + 1):
-
             if not slam.is_occupied(x, y):
                 continue
 
@@ -222,7 +229,6 @@ def find_nearest_front_obstacle_goal(
             if dist < min_cells or dist > max_cells:
                 continue
 
-            # Ângulo entre a direção do robô e a direção para o obstáculo
             dot = (vx * forward_x + vy * forward_y) / dist
             dot = max(-1.0, min(1.0, dot))
             angle_to_forward = math.acos(dot)
@@ -239,7 +245,6 @@ def find_nearest_front_obstacle_goal(
 
     ox, oy = best_obstacle
 
-    # Vetor unitário do robô para o obstáculo
     vx = ox - rx
     vy = oy - ry
     dist = math.sqrt(vx * vx + vy * vy)
@@ -250,7 +255,6 @@ def find_nearest_front_obstacle_goal(
     ux = vx / dist
     uy = vy / dist
 
-    # Ponto de paragem antes do obstáculo
     desired_gx = int(round(ox - ux * stop_cells))
     desired_gy = int(round(oy - uy * stop_cells))
 
@@ -269,24 +273,12 @@ def find_nearest_front_obstacle_goal(
     return nearby_goal, best_obstacle
 
 
-# ---------------------------------------------------------------
-# Configurações para navegação até à pessoa
-# ---------------------------------------------------------------
-
-PERSON_CENTER_TOLERANCE = 0.15       # offset visual entre -1 e 1
-PERSON_STOP_DISTANCE_M = 0.45        # parar a 70 cm da pessoa
-PERSON_FRONT_ANGLE_DEG = 40          # cone mais apertado porque a pessoa já deve estar centrada
-PERSON_MIN_DISTANCE_M = 0.70         # ignora obstáculos demasiado perto
-PERSON_MAX_DISTANCE_M = 4.00
-PERSON_SEARCH_RADIUS_M = 0.35
-
-
 def person_is_centered(offset_x, tolerance=PERSON_CENTER_TOLERANCE):
     """
-    Verifica se a pessoa está suficientemente centrada na câmara.
+    Verifica se a pessoa está suficientemente centrada.
 
-    offset_x:
-        valor entre -1 e 1 vindo da visão.
+    offset_x/yaw:
+        valor vindo da visão.
         0 significa centrado.
     """
     if offset_x is None:
@@ -306,7 +298,6 @@ def reached_goal(robot_cell, goal_cell, tolerance_m=0.25):
     gx, gy = goal_cell
 
     tolerance_cells = max(1, int(tolerance_m / MAP_RESOLUTION))
-
     dist_cells = math.sqrt((gx - rx) ** 2 + (gy - ry) ** 2)
 
     return dist_cells <= tolerance_cells
