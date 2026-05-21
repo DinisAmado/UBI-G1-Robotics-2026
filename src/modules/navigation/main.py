@@ -105,6 +105,13 @@ ENABLE_MOTION = False
 
 GOAL_TOLERANCE_M = 0.25
 
+WAYPOINT_TOLERANCE_M = 0.20
+
+MAX_LINEAR_SPEED = 0.15
+MAX_ANGULAR_SPEED = 0.30
+
+YAW_ALIGN_THRESHOLD = 0.35
+
 KNOWN_LOCATIONS = {
     "inicio": (0.0, 0.0),
     "mesa": (2.0, 0.0),
@@ -462,12 +469,14 @@ class NavigationModule:
 
         if self.current_goal_pose is None:
             self.current_path = []
+            self.current_waypoint_index = 0
             self.navigation_active = False
             self.stop_robot()
             self.publish_status(Status.FAILED, "Objetivo inválido", 0.0)
             return
 
         self.current_path = self.plan_path(self.current_goal_pose)
+        self.current_waypoint_index = 0
 
         if not self.current_path:
             self.navigation_active = False
@@ -482,7 +491,69 @@ class NavigationModule:
     # ==========================================================================
     # EXECUÇÃO DA NAVEGAÇÃO
     # ==========================================================================
+    
+    def normalize_angle(self, angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
 
+    def follow_path_step(self):
+        """
+        Envia velocidades para seguir o caminho A*.
+    
+        vx -> velocidade para a frente
+        vy -> velocidade lateral, por agora 0
+        wz -> velocidade angular
+        """
+    
+        if not self.current_path:
+            self.stop_robot()
+            return 0.0
+    
+        if self.current_waypoint_index >= len(self.current_path):
+            self.stop_robot()
+            return 1.0
+    
+        target_cell = self.current_path[self.current_waypoint_index]
+        target_x, target_y = cell_to_world(target_cell[0], target_cell[1])
+    
+        robot_x = self.current_pose.position.x
+        robot_y = self.current_pose.position.y
+    
+        dx = target_x - robot_x
+        dy = target_y - robot_y
+    
+        dist = math.sqrt(dx * dx + dy * dy)
+    
+        if dist <= WAYPOINT_TOLERANCE_M:
+            self.current_waypoint_index += 1
+    
+            if self.current_waypoint_index >= len(self.current_path):
+                self.stop_robot()
+                return 1.0
+    
+            target_cell = self.current_path[self.current_waypoint_index]
+            target_x, target_y = cell_to_world(target_cell[0], target_cell[1])
+    
+            dx = target_x - robot_x
+            dy = target_y - robot_y
+            dist = math.sqrt(dx * dx + dy * dy)
+    
+        desired_yaw = math.atan2(dy, dx)
+        yaw_error = self.normalize_angle(desired_yaw - self.current_yaw)
+    
+        if abs(yaw_error) > YAW_ALIGN_THRESHOLD:
+            vx = 0.0
+            vy = 0.0
+            wz = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, yaw_error))
+        else:
+            vx = min(MAX_LINEAR_SPEED, 0.5 * dist)
+            vy = 0.0
+            wz = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, yaw_error))
+    
+        self.send_cmd_vel(vx, vy, wz)
+    
+        progress = self.current_waypoint_index / max(len(self.current_path), 1)
+        return max(0.0, min(1.0, progress))
+    
     def update_navigation(self):
         if not self.navigation_active or self.current_goal_pose is None:
             self.stop_robot()
@@ -508,7 +579,7 @@ class NavigationModule:
         if not ENABLE_MOTION:
             self.stop_robot()
             progress = max(0.0, min(1.0, 1.0 - dist / 4.0))
-
+        
             now = time.time()
             if now - self.last_status_time >= 0.5:
                 self.publish_status(
@@ -517,11 +588,19 @@ class NavigationModule:
                     progress,
                 )
                 self.last_status_time = now
-
+        
             return
-
-        # Futuramente: aqui entra o path following real.
-        self.stop_robot()
+        
+        progress = self.follow_path_step()
+        
+        now = time.time()
+        if now - self.last_status_time >= 0.5:
+            self.publish_status(
+                Status.RUNNING,
+                "A navegar",
+                progress,
+            )
+            self.last_status_time = now
 
     # ==========================================================================
     # LOOP PRINCIPAL
