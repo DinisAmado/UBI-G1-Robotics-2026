@@ -56,6 +56,9 @@ from idl_ri import (
     NavPath,
     CmdVel,
     OdometryMsg,
+    Persons,
+    OrchestratorState,
+    Phase,
 )
 
 from qos_profiles import (
@@ -64,6 +67,8 @@ from qos_profiles import (
     QOS_NAV,
     QOS_MOTION,
     QOS_ODOMETRY,
+    QOS_VISION,
+    QOS_ORCHESTRATION,
 )
 
 # ==============================================================================
@@ -109,6 +114,10 @@ KNOWN_LOCATIONS = {
     "pessoa_3": (3.0, 1.0),
 }
 
+PERSON_CENTER_TOLERANCE = 0.15
+PERSON_STOP_DISTANCE_M = 0.45
+PERSON_YAW_GAIN = 0.4
+PERSON_MAX_ROT_SPEED = 0.30
 
 # ==============================================================================
 # CLASSE PRINCIPAL
@@ -128,6 +137,12 @@ class NavigationModule:
         self.current_goal_pose = None
         self.current_path = []
         self.navigation_active = False
+
+        self.current_phase = Phase.IDLE
+        self.target_person_id = ""
+        self.latest_persons = None
+        self.person_visible = False
+        self.person_yaw_error = None
 
         self.last_locations_time = 0.0
         self.last_status_time = 0.0
@@ -170,6 +185,25 @@ class NavigationModule:
         self.w_cmd_vel = DataWriter(pub, t_cmd_vel)
         self.r_odom = DataReader(sub, t_odom)
 
+        # Visão — pessoas
+        t_persons = Topic(
+            self.dp,
+            "rt/vision/persons",
+            Persons,
+            qos=QOS_VISION,
+        )
+        
+        self.r_persons = DataReader(sub, t_persons)
+        
+        # Orquestração — estado global
+        t_orch_state = Topic(
+            self.dp,
+            "rt/orchestration/state",
+            OrchestratorState,
+            qos=QOS_ORCHESTRATION,
+        )
+        
+        self.r_orch_state = DataReader(sub, t_orch_state)
     # ==========================================================================
     # HELPERS
     # ==========================================================================
@@ -274,6 +308,93 @@ class NavigationModule:
         samples = self.r_odom.take(1)
         return samples[0] if samples else None
 
+    def poll_persons(self):
+    samples = self.r_persons.take(1)
+    return samples[0] if samples else None
+
+
+    def poll_orchestration_state(self):
+        samples = self.r_orch_state.take(1)
+        return samples[0] if samples else None
+
+    def update_orchestration_state(self, state: OrchestratorState):
+    """
+    Atualiza a fase atual e a pessoa alvo vinda da orquestração.
+    """
+
+    self.current_phase = state.phase
+    self.target_person_id = state.current_target_person
+
+    log.info(
+        "[ORCH] fase=%s | target_person=%s",
+        self.current_phase.name,
+        self.target_person_id,
+    )
+
+
+    def update_persons(self, persons: Persons):
+        """
+        Guarda as deteções de pessoas vindas da visão.
+        """
+    
+        self.latest_persons = persons
+    
+        target = self.get_target_person_detection()
+    
+        if target is None:
+            self.person_visible = False
+            self.person_yaw_error = None
+            return
+    
+        self.person_visible = True
+        self.person_yaw_error = float(target.yaw)
+    
+        log.info(
+            "[VISION] pessoa=%s | yaw_error=%.3f | confidence=%.2f",
+            target.id,
+            self.person_yaw_error,
+            target.lip_movement_confidence,
+        )
+    
+    
+    def get_target_person_detection(self):
+        """
+        Devolve a deteção da pessoa alvo.
+    
+        Se a orquestração indicar current_target_person, procura esse id.
+        Se não houver id definido, escolhe a pessoa com maior lip_movement_confidence.
+        """
+    
+        if self.latest_persons is None:
+            return None
+    
+        detections = list(self.latest_persons.detections)
+    
+        if not detections:
+            return None
+    
+        if self.target_person_id:
+            for person in detections:
+                if person.id == self.target_person_id:
+                    return person
+    
+        # fallback: escolher a pessoa com maior confiança
+        detections.sort(key=lambda p: p.lip_movement_confidence, reverse=True)
+        return detections[0]
+    
+    
+    def person_is_centered(self):
+        """
+        Verifica se a pessoa está centrada usando o yaw publicado pela visão.
+        """
+    
+        if not self.person_visible:
+            return False
+    
+        if self.person_yaw_error is None:
+            return False
+    
+        return abs(self.person_yaw_error) <= PERSON_CENTER_TOLERANCE
     # ==========================================================================
     # ODOMETRIA
     # ==========================================================================
@@ -421,6 +542,16 @@ class NavigationModule:
                 odom = self.poll_odometry()
                 if odom:
                     self.update_odometry(odom)
+
+                # Ler estado da orquestração
+                orch_state = self.poll_orchestration_state()
+                if orch_state:
+                    self.update_orchestration_state(orch_state)
+                
+                # Ler deteções de pessoas da visão
+                persons = self.poll_persons()
+                if persons:
+                    self.update_persons(persons)
 
                 # 2. Publicar pose SLAM a 50 Hz
                 self.publish_pose()
