@@ -21,6 +21,8 @@ Modos úteis:
     python3 main.py --viz
     python3 main.py --lidar --viz
     python3 main.py --lidar --viz --host-ip 192.168.123.165
+    python3 main.py --lidar --viz --unitree-interface enp117s0
+    python3 main.py --lidar --viz --no-imu-fallback
 """
 
 import argparse
@@ -165,6 +167,8 @@ class NavigationModule:
         enable_viz=False,
         host_ip="192.168.123.165",
         config_path="mid360_config.json",
+        imu_fallback=True,
+        unitree_interface="enp117s0",
     ):
         self.seq = 0
 
@@ -172,6 +176,10 @@ class NavigationModule:
         self.enable_viz = enable_viz
         self.host_ip = host_ip
         self.config_path = config_path
+        self.imu_fallback = imu_fallback
+        self.unitree_interface = unitree_interface
+        self.current_lowstate = None
+        self.lowstate_sub = None
 
         self.current_pose = Pose(
             position=Vector3(x=0.0, y=0.0, z=0.0),
@@ -232,6 +240,20 @@ class NavigationModule:
             self.visualizer = MapVisualizer()
 
         # ----------------------------------------------------------------------
+        # FALLBACK TEMPORÁRIO DA IMU/LOWSTATE DA UNITREE
+        # ----------------------------------------------------------------------
+        #
+        # Enquanto o grupo da movimentação ainda não estiver a publicar
+        # rt/motion/odometry com yaw correto, este fallback lê diretamente
+        # o yaw da IMU do robô pelo LowState. Assim o occupancy grid deixa
+        # de "rodar" com o robô durante testes isolados com LiDAR.
+        #
+        # Quando a odometria do motion estiver estável, este fallback pode
+        # continuar ativo como segurança ou ser desligado com --no-imu-fallback.
+        if self.imu_fallback:
+            self.setup_unitree_imu_fallback()
+
+        # ----------------------------------------------------------------------
         # DDS SETUP
         # ----------------------------------------------------------------------
 
@@ -283,6 +305,64 @@ class NavigationModule:
             self.current_pose.position.x,
             self.current_pose.position.y,
         )
+
+    def lowstate_handler(self, msg):
+        self.current_lowstate = msg
+
+    def setup_unitree_imu_fallback(self):
+        """
+        Inicializa a leitura direta do LowState da Unitree para obter yaw da IMU.
+
+        Esta parte é temporária/auxiliar: serve para o main.py conseguir manter
+        o mapa estável quando ainda não há rt/motion/odometry vindo do grupo da
+        movimentação.
+        """
+        try:
+            from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+            log.info(
+                "A iniciar fallback IMU/LowState da Unitree na interface %s",
+                self.unitree_interface,
+            )
+
+            ChannelFactoryInitialize(0, self.unitree_interface)
+
+            self.lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+            self.lowstate_sub.Init(self.lowstate_handler, 10)
+
+            log.info("Fallback IMU/LowState ativo.")
+
+        except Exception as e:
+            self.imu_fallback = False
+            log.warning(
+                "Não foi possível iniciar fallback IMU/LowState. "
+                "O main.py continua, mas o yaw só virá de rt/motion/odometry. Erro: %s",
+                e,
+            )
+
+    def update_yaw_from_imu_fallback(self):
+        """
+        Atualiza self.current_yaw a partir da IMU do LowState, caso exista.
+
+        Não altera x/y. Só corrige a orientação para a point cloud do LiDAR ser
+        projetada no mapa com o yaw correto.
+        """
+        if not self.imu_fallback:
+            return
+
+        if self.current_lowstate is None:
+            return
+
+        try:
+            if hasattr(self.current_lowstate, "imu_state"):
+                self.current_yaw = float(self.current_lowstate.imu_state.rpy[2])
+
+                cell_x, cell_y = self.current_robot_cell()
+                self.slam.update_pose(cell_x, cell_y, self.current_yaw)
+
+        except Exception as e:
+            log.warning("Erro ao ler yaw da IMU/LowState: %s", e)
 
     def pose_from_xy(self, x, y, yaw=0.0) -> Pose:
         qx, qy, qz, qw = quaternion_from_yaw(yaw)
@@ -824,7 +904,13 @@ class NavigationModule:
 
     def run(self):
         log.info("SLAM + Navegação a iniciar no domínio %d", DOMAIN_ID)
-        log.info("Modo LiDAR=%s | Visualização=%s | ENABLE_MOTION=%s", self.enable_lidar, self.enable_viz, ENABLE_MOTION)
+        log.info(
+            "Modo LiDAR=%s | Visualização=%s | IMU fallback=%s | ENABLE_MOTION=%s",
+            self.enable_lidar,
+            self.enable_viz,
+            self.imu_fallback,
+            ENABLE_MOTION,
+        )
 
         self.publish_locations()
         self.publish_status(Status.DONE, "Módulo de navegação iniciado", 0.0)
@@ -837,6 +923,8 @@ class NavigationModule:
                 odom = self.poll_odometry()
                 if odom:
                     self.update_odometry(odom)
+                else:
+                    self.update_yaw_from_imu_fallback()
 
                 orch_state = self.poll_orchestration_state()
                 if orch_state:
@@ -883,6 +971,8 @@ def parse_args():
     parser.add_argument("--viz", action="store_true", help="Mostra janela Matplotlib com occupancy grid.")
     parser.add_argument("--host-ip", default="192.168.123.165", help="IP usado pelo LivoxReceiver.")
     parser.add_argument("--config-path", default="mid360_config.json", help="Caminho para o ficheiro de configuração do Livox.")
+    parser.add_argument("--unitree-interface", default="enp117s0", help="Interface de rede ligada ao robô para fallback IMU/LowState.")
+    parser.add_argument("--no-imu-fallback", action="store_true", help="Desativa leitura direta da IMU/LowState da Unitree.")
     return parser.parse_args()
 
 
@@ -903,4 +993,6 @@ if __name__ == "__main__":
         enable_viz=args.viz,
         host_ip=args.host_ip,
         config_path=args.config_path,
+        imu_fallback=not args.no_imu_fallback,
+        unitree_interface=args.unitree_interface,
     ).run()
