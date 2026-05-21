@@ -1,0 +1,6 @@
+numpy==2.2.6
+matplotlib==3.10.9
+cyclonedds==0.10.2
+mujoco==3.23.1
+opencv-python==4.13.0.92
+PyYAML==6.0.3
