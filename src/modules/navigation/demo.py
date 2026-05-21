@@ -39,6 +39,16 @@ from slam_navigation import SLAMNavigation
 from sensores import sensor_mujoco_json, pointcloud_to_occupancy_points
 from livox_receiver import LivoxReceiver
 
+from navigation import (
+    PERSON_CENTER_TOLERANCE,
+    PERSON_STOP_DISTANCE_M,
+    PERSON_FRONT_ANGLE_DEG,
+    PERSON_MIN_DISTANCE_M,
+    PERSON_MAX_DISTANCE_M,
+    PERSON_SEARCH_RADIUS_M,
+    person_is_centered,
+    reached_goal,
+)
 
 # ---------------------------------------------------------------
 # Configurações do mapa
@@ -320,12 +330,28 @@ class RobotController:
         os.makedirs(output_dir, exist_ok=True)
 
         # ---------------------------------------------------
-        # Objetivo local automático
+        # Estado da missão
         # ---------------------------------------------------
+        # Para já, é manual.
+        # Quando a orquestração estiver pronta, isto passa a vir do tópico DDS.
+        #
+        # Opções:
+        #   "GO_TO_TABLE"   -> ir até à mesa
+        #   "GO_TO_PERSON"  -> ir até à pessoa
+        #   "DONE"          -> terminado
+        # ---------------------------------------------------
+        
+        mission_phase = "GO_TO_TABLE"
+        
         current_goal_cell = None
         current_obstacle_cell = None
         current_path = []
         last_replan_time = 0.0
+        
+        # Valores temporários da visão.
+        # Mais tarde estes valores vêm do módulo da visão.
+        person_visible = False
+        person_offset_x = None
 
         # Posição inicial
         init_cell_x, init_cell_y = world_to_cell(self.pos_x, self.pos_y)
@@ -387,6 +413,22 @@ class RobotController:
             step_start = time.perf_counter()
 
             yaw = 0.0
+
+            # ---------------------------------------------------
+            # VISÃO — temporário para testes
+            # ---------------------------------------------------
+            # Mais tarde, estes valores vêm do tópico da visão.
+            # Por agora:
+            #   person_visible = True significa que a pessoa foi detetada
+            #   person_offset_x = 0.0 significa que está centrada
+            # ---------------------------------------------------
+            
+            if mission_phase == "GO_TO_PERSON":
+                person_visible = True
+                person_offset_x = 0.0
+            else:
+                person_visible = False
+                person_offset_x = None
 
             # Preferir odometria real do módulo SLAM da Unitree
             if self.current_odom is not None:
@@ -511,26 +553,87 @@ class RobotController:
                 )
 
                 if path_needs_replan:
-                    current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
-                        slam=slam,
-                        robot_cell=(curr_cell_x, curr_cell_y),
-                        robot_yaw=yaw,
-                        stop_distance_m=LOCAL_GOAL_STOP_DISTANCE_M,
-                        front_angle_deg=LOCAL_GOAL_FRONT_ANGLE_DEG,
-                        min_distance_m=LOCAL_GOAL_MIN_DISTANCE_M,
-                        max_distance_m=LOCAL_GOAL_MAX_DISTANCE_M,
-                        search_radius_m=LOCAL_GOAL_SEARCH_RADIUS_M
-                    )
-
-                    last_replan_time = now
-
-                    if current_goal_cell is not None:
-                        current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
-
-                        if not current_path:
+                    # ---------------------------------------------------
+                    # FASE 1 — ir até à mesa
+                    # ---------------------------------------------------
+                    if mission_phase == "GO_TO_TABLE":
+                
+                        current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
+                            slam=slam,
+                            robot_cell=(curr_cell_x, curr_cell_y),
+                            robot_yaw=yaw,
+                            stop_distance_m=LOCAL_GOAL_STOP_DISTANCE_M,
+                            front_angle_deg=LOCAL_GOAL_FRONT_ANGLE_DEG,
+                            min_distance_m=LOCAL_GOAL_MIN_DISTANCE_M,
+                            max_distance_m=LOCAL_GOAL_MAX_DISTANCE_M,
+                            search_radius_m=LOCAL_GOAL_SEARCH_RADIUS_M
+                        )
+                
+                        if current_goal_cell is not None:
+                            current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
+                
+                            if not current_path:
+                                current_goal_cell = None
+                        else:
+                            current_path = []
+                
+                    # ---------------------------------------------------
+                    # FASE 2 — ir até à pessoa
+                    # ---------------------------------------------------
+                    elif mission_phase == "GO_TO_PERSON":
+                
+                        # A pessoa ainda não foi detetada pela visão
+                        if not person_visible:
                             current_goal_cell = None
-                    else:
-                        current_path = []
+                            current_obstacle_cell = None
+                            current_path = []
+                            print("PESSOA | ainda não visível pela visão")
+                
+                        # A pessoa foi detetada, mas ainda não está centrada
+                        elif not person_is_centered(person_offset_x):
+                            current_goal_cell = None
+                            current_obstacle_cell = None
+                            current_path = []
+
+            print(
+                f"PESSOA | pessoa visível mas não centrada "
+                f"(offset_x={person_offset_x:.2f})"
+            )
+
+            # Mais tarde, aqui vamos enviar rotação:
+            #   offset_x < 0 -> rodar para um lado
+            #   offset_x > 0 -> rodar para o outro
+
+        # Pessoa centrada: agora o obstáculo frontal é assumido como a pessoa
+        else:
+            current_goal_cell, current_obstacle_cell = find_nearest_front_obstacle_goal(
+                slam=slam,
+                robot_cell=(curr_cell_x, curr_cell_y),
+                robot_yaw=yaw,
+                stop_distance_m=PERSON_STOP_DISTANCE_M,
+                front_angle_deg=PERSON_FRONT_ANGLE_DEG,
+                min_distance_m=PERSON_MIN_DISTANCE_M,
+                max_distance_m=PERSON_MAX_DISTANCE_M,
+                search_radius_m=PERSON_SEARCH_RADIUS_M
+            )
+
+            if current_goal_cell is not None:
+                current_path = slam.plan_path(current_goal_cell, allow_unknown=True)
+
+                if not current_path:
+                    current_goal_cell = None
+            else:
+                current_path = []
+
+    # ---------------------------------------------------
+    # FASE FINAL
+    # ---------------------------------------------------
+    else:
+        current_goal_cell = None
+        current_obstacle_cell = None
+        current_path = []
+
+    last_replan_time = now
 
                 # Debug do objetivo automático
                 if now - last_goal_debug_time >= 1.5:
@@ -543,11 +646,11 @@ class RobotController:
                         dist_goal_m = math.sqrt((gx - curr_cell_x) ** 2 + (gy - curr_cell_y) ** 2) * MAP_RESOLUTION
 
                         print(
-                            f"OBJETIVO AUTO | obstáculo=({ox},{oy}) dist={dist_obs_m:.2f} m | "
+                            f"FASE={mission_phase} | obstáculo=({ox},{oy}) dist={dist_obs_m:.2f} m | "
                             f"goal=({gx},{gy}) dist={dist_goal_m:.2f} m | path={len(current_path)}"
                         )
                     else:
-                        print("OBJETIVO AUTO | nenhum obstáculo frontal válido encontrado")
+                        print(f"FASE={mission_phase} | nenhum obstáculo frontal válido encontrado")
 
                 img.set_data(slam.get_visualization_grid())
 
