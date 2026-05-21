@@ -11,8 +11,10 @@ Publica:
     rt/motion/cmd_vel   (CmdVel)
 
 Subscreve:
-    rt/nav/goal         (NavGoal)
-    rt/motion/odometry  (OdometryMsg)
+    rt/nav/goal              (NavGoal)
+    rt/motion/odometry       (OdometryMsg)
+    rt/vision/persons        (Persons)
+    rt/orchestration/state   (OrchestratorState)
 
 Nota:
     Este ficheiro é apenas para integração DDS.
@@ -87,7 +89,6 @@ from navigation import (
     quaternion_from_yaw,
 )
 
-
 # ==============================================================================
 # CONFIGURAÇÃO
 # ==============================================================================
@@ -104,14 +105,14 @@ LOOP_DT = 0.02  # 50 Hz
 ENABLE_MOTION = False
 
 GOAL_TOLERANCE_M = 0.25
-
 WAYPOINT_TOLERANCE_M = 0.20
 
 MAX_LINEAR_SPEED = 0.15
 MAX_ANGULAR_SPEED = 0.30
-
 YAW_ALIGN_THRESHOLD = 0.35
 
+# Localizações temporárias para objetivos nomeados.
+# Mais tarde podem ser substituídas por dados reais vindos da orquestração/visão.
 KNOWN_LOCATIONS = {
     "inicio": (0.0, 0.0),
     "mesa": (2.0, 0.0),
@@ -121,10 +122,12 @@ KNOWN_LOCATIONS = {
     "pessoa_3": (3.0, 1.0),
 }
 
+# Parâmetros para centragem da pessoa com a informação da visão.
 PERSON_CENTER_TOLERANCE = 0.15
 PERSON_STOP_DISTANCE_M = 0.45
 PERSON_YAW_GAIN = 0.4
 PERSON_MAX_ROT_SPEED = 0.30
+
 
 # ==============================================================================
 # CLASSE PRINCIPAL
@@ -143,8 +146,10 @@ class NavigationModule:
         self.current_goal = None
         self.current_goal_pose = None
         self.current_path = []
+        self.current_waypoint_index = 0
         self.navigation_active = False
 
+        # Estado vindo da orquestração e da visão
         self.current_phase = Phase.IDLE
         self.target_person_id = ""
         self.latest_persons = None
@@ -153,6 +158,8 @@ class NavigationModule:
 
         self.last_locations_time = 0.0
         self.last_status_time = 0.0
+        self.last_orch_log_time = 0.0
+        self.last_vision_log_time = 0.0
 
         self.slam = SLAMNavigation(
             map_size=MAP_SIZE,
@@ -199,9 +206,9 @@ class NavigationModule:
             Persons,
             qos=QOS_VISION,
         )
-        
+
         self.r_persons = DataReader(sub, t_persons)
-        
+
         # Orquestração — estado global
         t_orch_state = Topic(
             self.dp,
@@ -209,8 +216,9 @@ class NavigationModule:
             OrchestratorState,
             qos=QOS_ORCHESTRATION,
         )
-        
+
         self.r_orch_state = DataReader(sub, t_orch_state)
+
     # ==========================================================================
     # HELPERS
     # ==========================================================================
@@ -235,6 +243,9 @@ class NavigationModule:
         dx = goal_pose.position.x - self.current_pose.position.x
         dy = goal_pose.position.y - self.current_pose.position.y
         return math.sqrt(dx * dx + dy * dy)
+
+    def normalize_angle(self, angle):
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     # ==========================================================================
     # PUBLICAÇÕES
@@ -304,7 +315,7 @@ class NavigationModule:
         self.send_cmd_vel(0.0, 0.0, 0.0)
 
     # ==========================================================================
-    # LEITURAS
+    # LEITURAS DDS
     # ==========================================================================
 
     def poll_goal(self):
@@ -316,92 +327,108 @@ class NavigationModule:
         return samples[0] if samples else None
 
     def poll_persons(self):
-    samples = self.r_persons.take(1)
-    return samples[0] if samples else None
-
+        samples = self.r_persons.take(1)
+        return samples[0] if samples else None
 
     def poll_orchestration_state(self):
         samples = self.r_orch_state.take(1)
         return samples[0] if samples else None
 
+    # ==========================================================================
+    # ORQUESTRAÇÃO E VISÃO
+    # ==========================================================================
+
     def update_orchestration_state(self, state: OrchestratorState):
-    """
-    Atualiza a fase atual e a pessoa alvo vinda da orquestração.
-    """
+        """
+        Atualiza a fase atual e a pessoa alvo vinda da orquestração.
+        """
 
-    self.current_phase = state.phase
-    self.target_person_id = state.current_target_person
+        previous_phase = self.current_phase
+        previous_target = self.target_person_id
 
-    log.info(
-        "[ORCH] fase=%s | target_person=%s",
-        self.current_phase.name,
-        self.target_person_id,
-    )
+        self.current_phase = state.phase
+        self.target_person_id = state.current_target_person
 
+        now = time.time()
+        changed = (
+            previous_phase != self.current_phase
+            or previous_target != self.target_person_id
+        )
+
+        if changed or now - self.last_orch_log_time >= 2.0:
+            log.info(
+                "[ORCH] fase=%s | target_person=%s | navigation_active=%s",
+                self.current_phase.name,
+                self.target_person_id,
+                state.active_modules.navigation,
+            )
+            self.last_orch_log_time = now
 
     def update_persons(self, persons: Persons):
         """
         Guarda as deteções de pessoas vindas da visão.
         """
-    
+
         self.latest_persons = persons
-    
+
         target = self.get_target_person_detection()
-    
+
         if target is None:
             self.person_visible = False
             self.person_yaw_error = None
             return
-    
+
         self.person_visible = True
         self.person_yaw_error = float(target.yaw)
-    
-        log.info(
-            "[VISION] pessoa=%s | yaw_error=%.3f | confidence=%.2f",
-            target.id,
-            self.person_yaw_error,
-            target.lip_movement_confidence,
-        )
-    
-    
+
+        now = time.time()
+        if now - self.last_vision_log_time >= 1.0:
+            log.info(
+                "[VISION] pessoa=%s | yaw_error=%.3f | confidence=%.2f",
+                target.id,
+                self.person_yaw_error,
+                target.lip_movement_confidence,
+            )
+            self.last_vision_log_time = now
+
     def get_target_person_detection(self):
         """
         Devolve a deteção da pessoa alvo.
-    
+
         Se a orquestração indicar current_target_person, procura esse id.
         Se não houver id definido, escolhe a pessoa com maior lip_movement_confidence.
         """
-    
+
         if self.latest_persons is None:
             return None
-    
+
         detections = list(self.latest_persons.detections)
-    
+
         if not detections:
             return None
-    
+
         if self.target_person_id:
             for person in detections:
                 if person.id == self.target_person_id:
                     return person
-    
-        # fallback: escolher a pessoa com maior confiança
+
+        # Fallback: escolher a pessoa com maior confiança.
         detections.sort(key=lambda p: p.lip_movement_confidence, reverse=True)
         return detections[0]
-    
-    
+
     def person_is_centered(self):
         """
         Verifica se a pessoa está centrada usando o yaw publicado pela visão.
         """
-    
+
         if not self.person_visible:
             return False
-    
+
         if self.person_yaw_error is None:
             return False
-    
+
         return abs(self.person_yaw_error) <= PERSON_CENTER_TOLERANCE
+
     # ==========================================================================
     # ODOMETRIA
     # ==========================================================================
@@ -431,7 +458,7 @@ class NavigationModule:
         Se for POSE, usa a pose enviada.
         """
 
-        # Tentar objetivo nomeado
+        # Tentar objetivo nomeado.
         try:
             name = goal.data.name
 
@@ -445,7 +472,7 @@ class NavigationModule:
         except Exception:
             pass
 
-        # Tentar objetivo por pose
+        # Tentar objetivo por pose.
         try:
             return goal.data.pose
         except Exception:
@@ -491,55 +518,52 @@ class NavigationModule:
     # ==========================================================================
     # EXECUÇÃO DA NAVEGAÇÃO
     # ==========================================================================
-    
-    def normalize_angle(self, angle):
-    return math.atan2(math.sin(angle), math.cos(angle))
 
     def follow_path_step(self):
         """
         Envia velocidades para seguir o caminho A*.
-    
+
         vx -> velocidade para a frente
         vy -> velocidade lateral, por agora 0
         wz -> velocidade angular
         """
-    
+
         if not self.current_path:
             self.stop_robot()
             return 0.0
-    
+
         if self.current_waypoint_index >= len(self.current_path):
             self.stop_robot()
             return 1.0
-    
+
         target_cell = self.current_path[self.current_waypoint_index]
         target_x, target_y = cell_to_world(target_cell[0], target_cell[1])
-    
+
         robot_x = self.current_pose.position.x
         robot_y = self.current_pose.position.y
-    
+
         dx = target_x - robot_x
         dy = target_y - robot_y
-    
+
         dist = math.sqrt(dx * dx + dy * dy)
-    
+
         if dist <= WAYPOINT_TOLERANCE_M:
             self.current_waypoint_index += 1
-    
+
             if self.current_waypoint_index >= len(self.current_path):
                 self.stop_robot()
                 return 1.0
-    
+
             target_cell = self.current_path[self.current_waypoint_index]
             target_x, target_y = cell_to_world(target_cell[0], target_cell[1])
-    
+
             dx = target_x - robot_x
             dy = target_y - robot_y
             dist = math.sqrt(dx * dx + dy * dy)
-    
+
         desired_yaw = math.atan2(dy, dx)
         yaw_error = self.normalize_angle(desired_yaw - self.current_yaw)
-    
+
         if abs(yaw_error) > YAW_ALIGN_THRESHOLD:
             vx = 0.0
             vy = 0.0
@@ -548,12 +572,12 @@ class NavigationModule:
             vx = min(MAX_LINEAR_SPEED, 0.5 * dist)
             vy = 0.0
             wz = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, yaw_error))
-    
+
         self.send_cmd_vel(vx, vy, wz)
-    
+
         progress = self.current_waypoint_index / max(len(self.current_path), 1)
         return max(0.0, min(1.0, progress))
-    
+
     def update_navigation(self):
         if not self.navigation_active or self.current_goal_pose is None:
             self.stop_robot()
@@ -564,12 +588,15 @@ class NavigationModule:
         if dist <= GOAL_TOLERANCE_M:
             self.navigation_active = False
             self.current_path = []
+            self.current_waypoint_index = 0
             self.stop_robot()
             self.publish_status(Status.DONE, "Objetivo alcançado", 1.0)
             return
 
         if not self.slam.is_path_valid(self.current_path):
             self.navigation_active = False
+            self.current_path = []
+            self.current_waypoint_index = 0
             self.stop_robot()
             self.publish_status(Status.FAILED, "Caminho ficou inválido", 0.0)
             return
@@ -579,7 +606,7 @@ class NavigationModule:
         if not ENABLE_MOTION:
             self.stop_robot()
             progress = max(0.0, min(1.0, 1.0 - dist / 4.0))
-        
+
             now = time.time()
             if now - self.last_status_time >= 0.5:
                 self.publish_status(
@@ -588,11 +615,11 @@ class NavigationModule:
                     progress,
                 )
                 self.last_status_time = now
-        
+
             return
-        
+
         progress = self.follow_path_step()
-        
+
         now = time.time()
         if now - self.last_status_time >= 0.5:
             self.publish_status(
@@ -622,30 +649,30 @@ class NavigationModule:
                 if odom:
                     self.update_odometry(odom)
 
-                # Ler estado da orquestração
+                # 2. Ler estado da orquestração
                 orch_state = self.poll_orchestration_state()
                 if orch_state:
                     self.update_orchestration_state(orch_state)
-                
-                # Ler deteções de pessoas da visão
+
+                # 3. Ler deteções de pessoas da visão
                 persons = self.poll_persons()
                 if persons:
                     self.update_persons(persons)
 
-                # 2. Publicar pose SLAM a 50 Hz
+                # 4. Publicar pose SLAM a 50 Hz
                 self.publish_pose()
 
-                # 3. Publicar localizações periodicamente
+                # 5. Publicar localizações periodicamente
                 if now - self.last_locations_time >= 5.0:
                     self.publish_locations()
                     self.last_locations_time = now
 
-                # 4. Ler novo objetivo
+                # 6. Ler novo objetivo
                 goal = self.poll_goal()
                 if goal:
                     self.handle_new_goal(goal)
 
-                # 5. Atualizar navegação
+                # 7. Atualizar navegação
                 self.update_navigation()
 
                 time.sleep(LOOP_DT)
