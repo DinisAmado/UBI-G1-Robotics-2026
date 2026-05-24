@@ -14,14 +14,12 @@ from cyclonedds.pub    import Publisher,  DataWriter
 from cyclonedds.sub    import Subscriber, DataReader
 from cyclonedds.topic  import Topic
 
-from qos_profiles import QOS_VISION, QOS_GRASP, QOS_ORCHESTRATION
+from qos_profiles import QOS_VISION, QOS_ORCHESTRATION
 from idl_ri import (
     Header,
     Pose6DOF,
     ObjectDetection,
     Objects,
-    GraspCommand,
-    Posture,
     OrchestratorState,
 )
 
@@ -316,9 +314,8 @@ def compute_pose_6dof(u, v, depth_raw, mask_pts):
 
 
 # Inferência & Publicação DDS
-def _run_inference(rgb_raw, depth_raw, frame_viz, model,
-                   w_objects, w_grasp, ema_alpha=EMA_ALPHA):
-    # type: (np.ndarray, np.ndarray, np.ndarray, YOLO, DataWriter, DataWriter, float) -> np.ndarray
+def _run_inference(rgb_raw, depth_raw, frame_viz, model, w_objects, ema_alpha=EMA_ALPHA):
+    # type: (np.ndarray, np.ndarray, np.ndarray, YOLO, DataWriter, float) -> np.ndarray
     with _target_object_lock:
         target = _target_object
 
@@ -354,11 +351,11 @@ def _run_inference(rgb_raw, depth_raw, frame_viz, model,
                     log.debug("[%s] Sem profundidade valida em (%d,%d)", label, u, v)
                     continue
 
-                # Filtro EMA (opera sobre lista, converte de/para Pose6DOF)
+                # Filtro EMA
                 if label not in _pose_filters:
                     _pose_filters[label] = PoseFilter(alpha=ema_alpha)
-                raw_list   = [pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw]
-                smooth     = _pose_filters[label].update(raw_list)
+                raw_list = [pose.x, pose.y, pose.z, pose.roll, pose.pitch, pose.yaw]
+                smooth   = _pose_filters[label].update(raw_list)
                 pose = Pose6DOF(
                     x=smooth[0], y=smooth[1], z=smooth[2],
                     roll=smooth[3], pitch=smooth[4], yaw=smooth[5],
@@ -379,26 +376,6 @@ def _run_inference(rgb_raw, depth_raw, frame_viz, model,
                     confidence = conf,
                     pose       = pose,
                 ))
-
-                # Publicar GraspCommand se for o objeto alvo
-                label_norm  = label.strip().lower()
-                target_norm = target.strip().lower()
-                if target_norm and label_norm == target_norm:
-                    cmd = GraspCommand(
-                        header    = _make_header(),
-                        objeto    = label,
-                        objeto_id = "",
-                        pose      = pose,
-                        postura   = Posture.EXTEND_ARM_FORWARD,
-                    )
-                    w_grasp.write(cmd)
-                    log.info(
-                        "[DDS -> rt/grasp/command] objeto='%s'  "
-                        "x=%.3f y=%.3f z=%.3f roll=%.4f pitch=%.4f yaw=%.4f",
-                        label,
-                        pose.x, pose.y, pose.z,
-                        pose.roll, pose.pitch, pose.yaw,
-                    )
 
                 # Visualização
                 cv2.fillPoly(overlay, np.int32([mask_pts]), color)
@@ -472,11 +449,9 @@ def main():
     sub = Subscriber(dp)
 
     t_objects = Topic(dp, "rt/vision/objects",      Objects,           qos=QOS_VISION)
-    t_grasp   = Topic(dp, "rt/grasp/command",       GraspCommand,      qos=QOS_GRASP)
     t_orch    = Topic(dp, "rt/orchestration/state", OrchestratorState, qos=QOS_ORCHESTRATION)
 
     w_objects = DataWriter(pub, t_objects)
-    w_grasp   = DataWriter(pub, t_grasp)
     r_orch    = DataReader(sub, t_orch)
 
     log.info("[DDS] Tópicos prontos.")
@@ -524,7 +499,6 @@ def main():
                 frame_viz = frame_viz_copy,
                 model     = model,
                 w_objects = w_objects,
-                w_grasp   = w_grasp,
                 ema_alpha = args.ema_alpha,
             )
 
