@@ -1,22 +1,17 @@
 # Módulo HMI — Unitree G1
 
-Sistema de Interação Humano-Robô por voz para o robô Unitree G1.
+Sistema de Interação Humano-Robô por voz para o robô Unitree G1, com integração na orquestração do projeto.
 
-**Fluxo:** microfone do robô (ZMQ) → Whisper (transcrição) → classificador → confirmação → DDS + voz nos altifalantes + LEDs
+**Ficheiro principal:** `hmi_main.py`
+
+**Fluxo:** microfone do robô (ZMQ) → VAD híbrido → Whisper (transcrição) → classificador → FSM confirmação → Intent DDS + voz nos altifalantes + LEDs
 
 ---
 
-## Dependências de sistema (Linux)
+## Dependências de sistema
 
 ```bash
 sudo apt install ffmpeg
-```
-
-## Instalar Ollama
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen2.5:1.5b
 ```
 
 ## Instalar dependências Python
@@ -28,97 +23,157 @@ pip install -r requirements.txt
 ## Correr
 
 ```bash
-# Terminal 1 — manter aberto
-ollama serve
-
-# Terminal 2
-python hri_ana.py
+python hmi_main.py
 ```
+
+---
+
+## Ficheiros necessários na mesma pasta
+
+| Ficheiro | Origem |
+|---|---|
+| `hmi_main.py` | Este módulo |
+| `idl_ri.py` | Partilhado pela orquestração |
+| `qos_profiles.py` | Partilhado pela orquestração |
 
 ---
 
 ## Configuração (topo do ficheiro)
 
-| Variável | Valor padrão | Descrição |
+| Variável | Valor | Descrição |
 |---|---|---|
-| `WHISPER_MODEL` | `large-v3-turbo` | Modelo Whisper — `medium` é mais rápido, `large-v3-turbo` é mais preciso para PT |
-| `OLLAMA_MODEL` | `qwen2.5:1.5b` | Modelo de conversa livre |
+| `WHISPER_MODEL` | `large-v3` | Modelo Whisper — requer GPU NVIDIA com CUDA |
 | `NET_INTERFACE` | `enp117s0` | Interface de rede ligada ao robô — verificar com `ip link show` |
 | `G1_IP` | `192.168.123.164` | IP do robô |
 | `PORT` | `5556` | Porto ZMQ do stream de áudio |
+| `DOMAIN_ID` | `0` | Domínio DDS partilhado com a orquestração |
 | `ROBOT_VOLUME` | `100` | Volume dos altifalantes do robô (0–100) |
-| `VAD_RMS_MIN` | `1200` | Volume mínimo (RMS) para aceitar áudio — aumenta se apanhar ruído, baixa se não detetar voz |
-| `WEBRTC_VAD_MODE` | `3` | Agressividade do WebRTC VAD: 0 (permissivo) a 3 (muito seletivo) |
-| `VAD_SILENCE_SECS` | `1.2` | Segundos de silêncio para terminar a gravação |
+| `VAD_RMS_MIN` | `1200` | Volume mínimo para aceitar áudio — aumenta se apanhar ruído |
+| `WEBRTC_VAD_MODE` | `3` | Agressividade do VAD: 0 (permissivo) a 3 (seletivo) |
+| `VAD_SILENCE_SECS` | `1.2` | Segundos de silêncio para terminar gravação |
 | `VAD_MIN_SPEECH_SECS` | `0.4` | Duração mínima de fala para não ignorar |
-| `PRE_BUFFER_SECS` | `0.5` | Áudio guardado antes da deteção — evita perder o início do comando |
-| `AUDIO_GAIN` | `1.6` | Ganho aplicado ao áudio antes do Whisper — aumenta se a voz vier baixa |
-| `MAX_RECORDING_SECS` | `5.0` | Tempo máximo de gravação por comando (segurança) |
+| `PRE_BUFFER_SECS` | `0.5` | Áudio guardado antes da deteção — evita perder início do comando |
+| `AUDIO_GAIN` | `1.6` | Ganho aplicado ao áudio antes do Whisper |
+| `MAX_RECORDING_SECS` | `3.0` | Tempo máximo de gravação por comando |
+
+---
+
+## Requisitos de hardware
+
+O Whisper `large-v3` com `compute_type="float16"` requer GPU NVIDIA com CUDA. Verificar disponibilidade:
+
+```bash
+nvidia-smi
+```
+
+Se não houver GPU, alterar no código:
+```python
+whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+```
+
+---
+
+## Ordem de inicialização (crítica)
+
+O `ChannelFactoryInitialize` do SDK Unitree **tem de ser chamado antes** de qualquer `DomainParticipant`. O código garante esta ordem:
+
+```
+ChannelFactoryInitialize(0, NET_INTERFACE)  ← 1º
+HmiNode()           → DomainParticipant    ← 2º
+RobotSpeaker()      → AudioClient          ← 3º
+LedController()     → reutiliza AudioClient ← 4º
+```
 
 ---
 
 ## Deteção de voz (VAD)
 
-O sistema usa uma abordagem híbrida em dois níveis:
+Abordagem híbrida em dois níveis:
 
 1. **RMS mínimo** (`VAD_RMS_MIN`) — filtra silêncio absoluto e ruídos muito fracos
-2. **WebRTC VAD** (`webrtcvad`) — detetor de voz humana desenvolvido pela Google, robusto ao ruído dos motores do G1
+2. **WebRTC VAD** (`webrtcvad`) — detetor de voz humana da Google, robusto ao ruído dos motores do G1
 
-O WebRTC VAD divide cada chunk de áudio em frames de 30ms e exige que pelo menos 60% sejam classificadas como voz. Um pré-buffer de 0.5s é mantido para não perder o início de comandos curtos como "para" ou "sim".
+Um pré-buffer de 0.5s evita perder o início de comandos curtos como "para" ou "sim".
+
+---
+
+## Classificador de comandos
+
+Usa correspondência por palavras-chave com normalização (minúsculas + remoção de acentos) e fronteiras de palavra para evitar falsas correspondências.
+
+Inclui verificação de segurança: se o texto contiver "não" e a ação classificada for CONFIRMAR, corrige automaticamente para CANCELAR.
+
+Quando deteta um alvo (objeto) mas não reconhece a ação, assume TRAZER e entra em modo de confirmação.
+
+---
+
+## Ações possíveis
+
+**Precisam de confirmação:**
+`TRAZER` `AGARRAR`
+
+**Publicam Intent imediatamente:**
+`ANDAR` `PARAR` `RECUAR` `LEVANTAR` `SENTAR` `VIRAR_ESQUERDA` `VIRAR_DIREITA` `OLHAR_INTERLOCUTOR` `OLHAR_FRENTE` `CUMPRIMENTAR` `APRESENTAR` `ESTADO_ATUAL` `REPETIR` `LARGAR`
+
+**Controlo de fluxo:**
+`CONFIRMAR` `CANCELAR`
+
+## Alvos possíveis
+
+`BOLA_DE_TENIS` → `"bola"` · `CUBO_DE_RUBIK` → `"cubo"` · `PASTA_DE_DENTES` → `"pasta"`
+
+---
+
+## Integração com a Orquestração
+
+### Tópicos DDS
+
+| Tópico | Direção | Tipo | QoS |
+|---|---|---|---|
+| `rt/hmi/intent` | Publica | `Intent` | `QOS_HMI` |
+| `rt/hmi/feedback` | Subscreve | `Feedback` | `QOS_HMI` |
+
+### Mapeamento de ações HRI → Acao
+
+| Ação HRI | Acao orquestração | Alvo |
+|---|---|---|
+| `TRAZER` / `AGARRAR` | `Acao.RECOLHER` | `"bola"` / `"cubo"` / `"pasta"` |
+| `PARAR` / `ANDAR` / `RECUAR` | `Acao.PARAR` | `""` |
+| `LARGAR` | `Acao.LARGA` | `""` |
+
+### Feedback da orquestração
+
+Quando chega `Feedback`, o HMI apresenta o estado ao utilizador via TTS e ajusta os LEDs:
+
+| `fb.status` | LED | Exemplo de mensagem |
+|---|---|---|
+| `Status.DONE` | 🟢 Verde | mensagem do orquestrador |
+| `Status.FAILED` | 🔴 Vermelho | mensagem do orquestrador |
+| `OrchestrationState.NAVIGATING_*` / `GRASPING_*` | 🟠 Laranja | "A navegar até à mesa." |
 
 ---
 
 ## LEDs
 
-Os LEDs do G1 indicam o estado do sistema em tempo real:
+O firmware do G1 (sport_mode) repõe continuamente a cor azul. Para competir com esse comportamento, o `LedController` usa um **thread dedicado** que reenvia a cor desejada a cada 200ms.
 
 | Cor | Estado |
 |---|---|
 | 🔵 Azul | A ouvir — à espera de comando |
+| 🟠 Laranja | A processar (Whisper) ou ação pendente |
 | 🟢 Verde | A falar — Johnny está a responder |
-| 🔴 Vermelho | Cancelado — utilizador disse não |
+| 🔴 Vermelho | Cancelado ou não percebeu |
 | ⚫ Desligado | Sistema encerrado |
-
-O `LedController` reutiliza o mesmo `AudioClient` do `RobotSpeaker` — o `ChannelFactoryInitialize` é chamado **uma única vez** para evitar conflitos.
 
 ---
 
 ## Voz nos altifalantes
 
-O `RobotSpeaker` gere a reprodução de voz no G1:
-
 1. Edge TTS gera MP3 em `pt-PT-DuarteNeural`
-2. `ffmpeg` converte para WAV 16kHz mono (formato exigido pelo `AudioClient`)
-3. `AudioClient` do SDK Unitree envia o PCM para os altifalantes do robô
+2. `ffmpeg` converte para WAV 16kHz mono
+3. `AudioClient` do SDK Unitree envia PCM para os altifalantes do robô
 
-Se o `AudioClient` não estiver disponível, o áudio é reproduzido no PC como fallback (via `pygame`).
-
----
-
-## Tópico DDS publicado
-
-**Nome:** `HRICommands`
-
-| Campo | Tipo | Exemplo |
-|---|---|---|
-| `source` | str | `"HRI"` |
-| `original_text` | str | `"traz-me a bola"` |
-| `action` | str | `"TRAZER"` |
-| `target` | str | `"BOLA_DE_TENIS"` |
-| `confirmed` | bool | `True` |
-| `timestamp` | str | `"2026-05-13T14:32:00"` |
-
-### Actions possíveis
-`ANDAR` `PARAR` `RECUAR` `LEVANTAR` `SENTAR` `VIRAR_ESQUERDA` `VIRAR_DIREITA`
-`OLHAR_INTERLOCUTOR` `OLHAR_FRENTE` `CUMPRIMENTAR` `APRESENTAR` `ESTADO_ATUAL`
-`REPETIR` `IR_BUSCAR` `TRAZER` `AGARRAR` `LARGAR` `CONFIRMAR` `CANCELAR` `DESCONHECIDA`
-
-### Targets possíveis
-`BOLA_DE_TENIS` `CUBO_DE_RUBIK` `PASTA_DE_DENTES` `NENHUM` `DESCONHECIDO`
-
-### Lógica de confirmação
-`TRAZER`, `IR_BUSCAR` e `AGARRAR` só são publicados **após confirmação verbal** do utilizador.
-Todas as outras ações são publicadas **imediatamente**.
+Fallback automático para `pygame` se o `AudioClient` não estiver disponível.
 
 ---
 
@@ -126,11 +181,11 @@ Todas as outras ações são publicadas **imediatamente**.
 
 ```
 faster-whisper
-pygame
 edge-tts
-cyclonedds
-ollama
+pygame
+webrtcvad
 pyzmq
 lz4
-webrtcvad
+cyclonedds
+# unitree_sdk2py — instalar do repositório SDK
 ```

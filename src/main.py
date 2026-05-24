@@ -298,10 +298,7 @@ class Orchestrator:
                 self._ctx.last_object_pose = det.pose
                 log.info("Objecto '%s' localizado (conf=%.2f)", det.name, det.confidence)
 
-                self._w_nav_goal.write(Goal(
-                    header=self._make_header(),
-                    data=GoalData(GoalType.NAMED, TABLE_LOCATION_NAME),
-                ))
+                self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
                 self._transition(Phase.NAVIGATING_TO_TABLE,
                                  f"a navegar para '{TABLE_LOCATION_NAME}'")
                 return
@@ -339,13 +336,13 @@ class Orchestrator:
         if sample.status == Status.DONE:
 
             if self._phase == Phase.GRASPING_OBJECT:
-                # Objeto agarrado — braço em postura de transporte
+                # Objeto agarrado — braço em postura de transporte (mão fechada)
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto=self._ctx.last_object_name,
                     objeto_id="carry",
                     pose=Pose6DOF(),
-                    postura=Posture.NEUTRAL,
+                    postura=Posture.EXTEND_ARM_FORWARD,
                 ))
 
                 # Navega até à pessoa identificada pelos lábios
@@ -361,8 +358,16 @@ class Orchestrator:
                                        "pessoa não encontrada no SLAM")
 
             elif self._phase == Phase.DELIVERING:
-                # Entrega concluída
-                log.info("Entrega concluída com sucesso!")
+                # Braço estendido — enviar comando para abrir a mão e retrair o braço
+                self._w_grasp_cmd.write(GraspCommand(
+                    header=self._make_header(),
+                    objeto=self._ctx.last_object_name,
+                    objeto_id="drop",
+                    pose=Pose6DOF(),
+                    postura=Posture.NEUTRAL,
+                ))
+                log.info("Objeto '%s' entregue — a abrir mão e retrair braço",
+                         self._ctx.last_object_name)
                 self._ctx.retry_counts = {p: 0 for p in Phase}
                 self._transition(Phase.IDLE, "tarefa concluída")
 
@@ -458,14 +463,15 @@ class Orchestrator:
         if self._ctx.known_locations:
             for loc in self._ctx.known_locations.locations:
                 if loc.name == self._ctx.last_person_id:
-                    return Goal(
-                        header=self._make_header(),
-                        data=GoalData(GoalType.NAMED, loc.name),
-                    )
+                    return self._make_named_goal(loc.name)
 
         log.warning("Pessoa '%s' não encontrada nas localizações SLAM.",
                     self._ctx.last_person_id)
         return None
+
+    def _make_named_goal(self, name: str) -> Goal:
+        data = GoalData(name=name)
+        return Goal(header=self._make_header(), data=data)
 
     def _make_header(self) -> Header:
         with self._lock:

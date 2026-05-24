@@ -42,20 +42,35 @@ kPi_2 = 1.57079632
 
 class MovementConfigs:
 
-    # Arm Standard Position
-    ArmStandardPosition = [(15, 0.1019), (16, 0.2136), (17, 0.1771), (18, 0.1842), (19, -0.0336), (20, -0.0532), (21, 0.0868), (22, 0.1035), (23, -0.3205), (24, -0.0719), (25, 0.0792), (26, -0.0667), (27, 0.0186), (28, -0.0127)]
+    # Posição padrão dos dois braços (joints 15-28)
+    ArmStandardPosition = [
+        (15,  0.1019), (16,  0.2136), (17,  0.1771), (18,  0.1842),
+        (19, -0.0336), (20, -0.0532), (21,  0.0868),
+        (22,  0.1035), (23, -0.3205), (24, -0.0719), (25,  0.0792),
+        (26, -0.0667), (27,  0.0186), (28, -0.0127),
+    ]
 
-    # Arm Up Position
-    ArmUpPosition = None # alterar maybe
+    # Braço direito em cima (pose 1 — intermédia)
+    RightArmUP1Position = [
+        (22, -0.2416), (23, -0.7700), (24, -0.0620),
+        (25,  0.2747), (26,  1.1240), (27, -0.2075), (28,  0.9425),
+    ]
 
-    # Arm Giving Position
-    ArmGivingPosition = [(22, -0.5741), (23, -0.1391), (24, -0.2563), (25, 0.5985), (26, -0.0296), (27, -0.1613), (28, 0.1152)]
+    # Braço direito em cima (pose 2 — final após grasp / lift)
+    RightArmUP2Position = [
+        (22, -0.3068), (23, -1.1202), (24, -0.0598),
+        (25,  0.2346), (26,  1.4680), (27, -0.2060), (28,  1.2231),
+    ]
 
-    RightArmUP1Position = [(22, -0.2416), (23, -0.77), (24, -0.062), (25, 0.2747), (26, 1.124), (27, -0.2075), (28, 0.9425)]
+    # Braço direito estendido para frente (entregar) — alterar conforme calibração
+    ArmGivingPosition = [
+        (22, -0.8576), (23, -0.101), (24, 0.0354), (25, 0.411), (26, 0.2811), (27, 0.1713), (28, 0.0899)
+    ]
 
-
-    RightArmUP2Position = [ (22, -0.3068), (23, -1.1202), (24, -0.0598), (25, 0.2346), (26, 1.468), (27, -0.206), (28, 1.2231)]
-
+    # Braço direito em posição de transporte (carry) — neutro ao lado do corpo
+    ArmCarryPosition = [
+        (22, -0.2214), (23, -0.0227), (24, -0.2982), (25, 0.04), (26, 0.171), (27, -1.0556), (28, -0.0411)
+    ]
 
 
 
@@ -179,58 +194,6 @@ class Custom:
             self.first_update_low_state = True
 
 
-    ## Foward Kinematics
-    def _get_current_ee_se3(self):
-        q_arms = [self.low_state.motor_state[j].q for j in range(15, 29)]
-
-        cmd = [
-            "conda", "run", "-n", "g1_ik",
-            "python", "run_fk.py",
-            "--current_q", json.dumps(q_arms),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"FK failed:\n{result.stderr}")
-
-        se3s = {}
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                d = json.loads(line)
-                mat = np.eye(4)
-                mat[:3, :3] = np.array(d["rotation"])
-                mat[:3,  3] = np.array(d["position"])
-                se3s[d["arm"]] = mat
-
-        if "left" not in se3s or "right" not in se3s:
-            raise RuntimeError(f"FK output incompleto:\n{result.stdout}")
-
-        return se3s["left"], se3s["right"]
-
-
-    ## Inverse Kinematics
-
-    def _octo_run(self, image_path, task_text):
-        # create run sub-process
-        cmd_octo = [
-        "conda", "run", "-n", "octo",
-        "python", "run_octo.py",
-        "--image", image_path,
-        "--task",  task_text,
-        ]
-        result = subprocess.run(cmd_octo, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"Octo subprocess failed:\n{result.stderr}")
-
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                actions = json.loads(line)  # dict com "action_1" ... "action_N"
-                return actions
-
-        raise RuntimeError(f"No JSON found in stdout:\n{result.stdout}")
-
-
     def _pose_to_SE3(self,action):
 
         """
@@ -278,7 +241,7 @@ class Custom:
         start_q = {
             j: self.low_state.motor_state[j].q
             for j, _ in targets
-        }
+        } 
         start_time = time.time()
         print("Starting smooth joint motion...")
         while True:
@@ -385,114 +348,96 @@ class Custom:
             self.move_joints(Move)
             self.next_state()
             time.sleep(2)
-          """
-        elif self.estado==1:
-            while True:
-                mode = input("(vla/man) Qual modo de calculo das Poses e IK: ")
-
-                if mode == "vla":
-                    # Capturar Imagem e fazer IK
-                    action_configs = {}
-                    self.right_arm_state = [self.low_state.motor_state[j].q for j in [22,23,24,25,26,27,28]]
-
-                    ## Capturar e Salvar a Imagem
-
-                    image_path = "/home/nova-lincs-04/unitree_sdk2_python/RI/4/test_2_files/test_01.png"
-
-                    ## Run octo
-                    text_order = "Pick up the green tennis ball."
-
-                    actions_6dof = self._octo_run(image_path, text_order)
-
-                    for action, array_action in actions_6dof.items():
-
-                        gripper_value = min(0.8, array_action[-1])
-                        end_effector_pose = array_action[0:7]
-
-                        left_wrist_se3  = np.eye(4) # Manter braço parado
-                        right_wrist_se3 = self._pose_to_SE3(end_effector_pose)
-
-                        action_config = self._solve_ik_run(left_wrist_se3,right_wrist_se3)
-                        right_arm_config = action_config[7:]
-                        ## Verificar aqui foward K
-                        action_configs[action] = [self.right_arm_state + right_arm_config, gripper_value]
-
-                    self.action_configs = action_configs
-
-                    print("Done IK, going to action!!!!!")
-                    self.next_state()
-                    break
-                    time.sleep(2)
-                elif mode == "man":
-                    break
-                    pass
-                else:
-                    print("Coloque 'vla' ou 'man'. ")
-
-        elif self.estado==2:
-            # Abrir as mãos antes do grasp
-            Move = MovementConfigs.RightArmUP1Position
-            self.move_joints(Move)
-            self.hand_r.grip(0.1)
-            self.next_state()
-            time.sleep(2)"""
 
         elif self.estado==1:
             # ─── 1. Pose do objeto (recebes da câmara) ─────────────────────
             # T_base_obj já transformada (câmara → base)
             # Assumindo que já tens isto calculado antes
-            self.target_object_pose = self._pose_to_SE3(
-            T_base_obj = self.target_object_pose  # 4x4 np.ndarray
+            self.target_object_pose = self._pose_to_SE3([np.float64(0.083), np.float64(-0.066), np.float64(0.468), 7.15, -14.5, -25.14])
+            self.T_base_obj = self.target_object_pose  # 4x4 np.ndarray
 
             # ─── 2. Calcula pré-grasp (sobe no Z do mundo) ─────────────────
-            T_pregrasp = T_base_obj.copy()
-            T_pregrasp[:3, 3] += np.array([0.0, 0.15, 0.0])  # 15cm acima
+            T_pregrasp = self.T_base_obj.copy()
+            T_pregrasp[:3, 3] += np.array([0.0, 0.0, 0.15])  # 15cm acima
 
             # ─── 3. IK para pré-grasp ──────────────────────────────────────
-            left_wrist = np.eye(4)  # braço esquerdo parado
+            self.left_wrist = np.eye(4)  # braço esquerdo parado
             q_current = [self.low_state.motor_state[j].q for j in range(15, 29)]
 
             pregrasp_joints = self._solve_ik_run(
-                left_wrist,
+                self.left_wrist,
                 T_pregrasp,
                 current_q=np.array(q_current)
             )
             right_pregrasp = pregrasp_joints[7:]  # só braço direito
+            self.pregrasp = right_pregrasp
+            sla = input("Clica enter se ta tudo bem, agora vem o pregrasp prepara para o desastre")
+            self.next_state()
 
+        elif self.estado==2:
+            print('AQUI VAI!!!')
             # ─── 4. Move para pré-grasp ────────────────────────────────────
             self.hand_r.grip(0.1)  # abre mão antes de mover
-            self.move_joints(right_pregrasp)
+            self.move_joints(self.pregrasp)
             time.sleep(1)
 
+            sla = input('Clica enter para ver se ta tudo bem, Calculo do IK grasp')
+            self.next_state()
+        elif self.estado==3:
+            print('Calma agora matemática brinca')
             # ─── 5. IK para grasp (parte do pré-grasp!) ────────────────────
             q_at_pregrasp = [self.low_state.motor_state[j].q for j in range(15, 29)]
 
+
+            T_grasp = self.T_base_obj.copy()
+            T_grasp[:3, 3] += np.array([0.0, 0.0, 0.06])  # 15cm acima
+
             grasp_joints = self._solve_ik_run(
-                left_wrist,
-                T_base_obj,
+                self.left_wrist,
+                T_grasp,
                 current_q=np.array(q_at_pregrasp)  # começa perto!
             )
             right_grasp = grasp_joints[7:]
-
+            self.grasp = right_grasp
+            sla = input('Clica enter para ver se ta tudo bem, agora vai o grasp')
+            self.next_state()
+        elif  self.estado==4:
+            print('AQUI VAI!!! AGAINNNNN!!!')
             # ─── 6. Desce devagar para o objeto ────────────────────────────
-            self.move_joints(right_grasp, duration=3.0)  # mais lento
+            self.move_joints(self.grasp, duration=3.0)  # mais lento
             time.sleep(0.5)
 
             # ─── 7. Fecha mão ──────────────────────────────────────────────
-            self.hand_r.grip(0.8)
+            self.hand_r.grip(0.6)
             time.sleep(0.8)  # deixa estabilizar
-
+            sla = input('Clica enter para ver se ta tudo bem,')
             self.next_state()
 
-        #elif self.state==4:
-        #    # Agarra o objeto e verificar se ta agarrado (maybe)
-        #    time.sleep(10)
-
-        elif self.estado==2:
-            # Levantar o braço
-            Move = MovementConfigs.ArmUP2Position
+        elif self.estado==5:
+            Move = MovementConfigs.RightArmUP2Position
             self.move_joints(Move)
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==6:
+            Move2 = MovementConfigs.ArmCarryPosition
+            self.move_joints(Move2)
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==7:
+            Move3 = MovementConfigs.ArmGivingPosition
+            self.move_joints(Move3)
+            sla = input('Clica enter para ver se ta tudo bem,')
+            self.next_state()
+
+        elif self.estado==8:
+            # Levantar o braço
+            
+            Move4 = MovementConfigs.ArmStandardPosition
+            self.move_joints(Move4)
             self.hand_r.stop()
+            sla = input('Clica enter para ver se ta tudo bem,')
             self.next_state()
             time.sleep(2)
 

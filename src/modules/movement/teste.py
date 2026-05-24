@@ -3,7 +3,7 @@ import os
 import time
 import math
 
-# Ajuste de path para importar os módulos da pasta src
+# Ajustar path para importar os módulos da pasta src
 pasta_atual = os.path.dirname(os.path.abspath(__file__))
 pasta_src = os.path.abspath(os.path.join(pasta_atual, '..'))
 if pasta_src not in sys.path:
