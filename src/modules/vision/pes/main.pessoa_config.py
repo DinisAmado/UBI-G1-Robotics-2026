@@ -21,9 +21,10 @@ from insightface.app import FaceAnalysis
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-import sys, os
+import sys
+import os
 _pasta_atual = os.path.dirname(os.path.abspath(__file__))
-_pasta_src   = os.path.abspath(os.path.join(_pasta_atual, '..', '..'))
+_pasta_src   = os.path.abspath(os.path.join(_pasta_atual, '..', '..', '..'))
 if _pasta_src not in sys.path:
     sys.path.insert(0, _pasta_src)
   
