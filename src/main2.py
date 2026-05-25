@@ -261,10 +261,9 @@ class Orchestrator:
         if sample.acao in (Acao.ENTREGAR, Acao.RECOLHER):
             self._ctx.last_object_name  = sample.alvo
             self._ctx.last_object_pose = None
-            # 1º PASSO: Navegar para a mesa PRIMEIRO
-            self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
-            self._transition(Phase.NAVIGATING_TO_TABLE,
-                             f"a navegar para '{TABLE_LOCATION_NAME}' (buscar '{sample.alvo}')")
+            # 1º PASSO: Localizar o objeto com a visão PRIMEIRO
+            self._transition(Phase.LOCATING_OBJECT,
+                             f"à procura de '{sample.alvo}'")
 
         elif sample.acao == Acao.LARGA:
             self._w_grasp_cmd.write(GraspCommand(
@@ -296,11 +295,17 @@ class Orchestrator:
             return
 
         if sample.status == Status.DONE:
-            # 2º PASSO: Chegou à mesa — AGORA transita para localizar o objeto com a visão
-            log.info("Chegou à mesa — a iniciar localização de '%s'",
-                     self._ctx.last_object_name)
-            self._transition(Phase.LOCATING_OBJECT,
-                             f"à procura de '{self._ctx.last_object_name}'")
+            # 3º PASSO: Chegou à mesa — mandar o braço agarrar o objeto já localizado
+            log.info("Chegou à mesa — a agarrar '%s'", self._ctx.last_object_name)
+            self._w_grasp_cmd.write(GraspCommand(
+                header=self._make_header(),
+                objeto=self._ctx.last_object_name,
+                objeto_id="",
+                pose=self._ctx.last_object_pose,
+                postura=Posture.EXTEND_ARM_FORWARD,
+            ))
+            self._transition(Phase.GRASPING_OBJECT,
+                             f"a agarrar '{self._ctx.last_object_name}'")
 
         elif sample.status == Status.FAILED:
             self._handle_retry(self._phase, sample.reason)
@@ -319,16 +324,10 @@ class Orchestrator:
                 self._ctx.last_object_pose = det.pose
                 log.info("Objecto '%s' localizado (conf=%.2f)", det.name, det.confidence)
 
-                # 3º PASSO: Objeto localizado — mandar o braço agarrar!
-                self._w_grasp_cmd.write(GraspCommand(
-                    header=self._make_header(),
-                    objeto=self._ctx.last_object_name,
-                    objeto_id="",
-                    pose=det.pose,
-                    postura=Posture.EXTEND_ARM_FORWARD,
-                ))
-                self._transition(Phase.GRASPING_OBJECT,
-                                 f"a agarrar '{self._ctx.last_object_name}'")
+                # 2º PASSO: Objeto localizado — navegar até à mesa
+                self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
+                self._transition(Phase.NAVIGATING_TO_TABLE,
+                                 f"a navegar para '{TABLE_LOCATION_NAME}' (buscar '{self._ctx.last_object_name}')")
                 return
 
     def _handle_grasp_status(self) -> None:

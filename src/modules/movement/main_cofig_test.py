@@ -4,11 +4,11 @@ import time
 import logging
 import math
 
-# Alterar paths
+# Sobe 2 níveis: src/modules/5_motion/ → src/modules/ → src/
 pasta_atual = os.path.dirname(os.path.abspath(__file__))
 pasta_src = os.path.abspath(os.path.join(pasta_atual, '../..'))
 if pasta_src not in sys.path:
-    sys.path.append(pasta_src)
+    sys.path.insert(0, pasta_src)
 
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
@@ -31,7 +31,6 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] MOTION: %(message)s")
 log = logging.getLogger("motion")
-
 
 class MotionModule:
     def __init__(self, network_interface="enp117s0"):
