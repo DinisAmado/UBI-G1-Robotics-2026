@@ -14,11 +14,12 @@ from cyclonedds.pub    import Publisher,  DataWriter
 from cyclonedds.sub    import Subscriber, DataReader
 from cyclonedds.topic  import Topic
  
-import sys, os
-# ── Path para src/ (idl_ri.py e qos_profiles.py) ─────────────────────────────
-# Sobe 2 níveis: src/modules/3_vision/ → src/modules/ → src/
+import sys
+import os
+# ── Path para src/ ──────────────────────────────────────────────────────────
+# Sobe 3 níveis (ex: src/modules/3_vision/sub_pasta/ → src/modules/3_vision/ → src/modules/ → src/)
 _pasta_atual = os.path.dirname(os.path.abspath(__file__))
-_pasta_src   = os.path.abspath(os.path.join(_pasta_atual, '..', '..'))
+_pasta_src   = os.path.abspath(os.path.join(_pasta_atual, '..', '..', '..'))
 if _pasta_src not in sys.path:
     sys.path.insert(0, _pasta_src)
  
