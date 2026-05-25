@@ -4,7 +4,7 @@ import time
 import logging
 import math
 
-# Alterar pastas
+# Alterar paths
 pasta_atual = os.path.dirname(os.path.abspath(__file__))
 pasta_src = os.path.abspath(os.path.join(pasta_atual, '../..'))
 if pasta_src not in sys.path:
