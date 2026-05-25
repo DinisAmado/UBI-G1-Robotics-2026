@@ -74,6 +74,10 @@ _state_lock = threading.Lock()
 _target_object      = ""
 _target_object_lock = threading.Lock()
 
+# Flag de ativacao — controlado pelo orquestrador via active_modules.vision_objects
+_vision_active      = True
+_vision_active_lock = threading.Lock()
+
 # Sequência global para headers DDS
 _seq      = 0
 _seq_lock = threading.Lock()
@@ -180,20 +184,27 @@ def _rx_realsense(stop, robot_ip):
         log.error("[ZMQ] Erro fatal: %s", exc, exc_info=True)
 
 
-# DDS Subscriber — recebe objeto alvo do orquestrador
+# DDS Subscriber — recebe objeto alvo e estado de ativacao do orquestrador
 def _rx_orchestrator(stop, reader):
     # type: (threading.Event, DataReader) -> None
-    global _target_object
+    global _target_object, _vision_active
     while not stop.is_set():
         samples = reader.take(10)
         for sample in samples:
             if sample is None:
                 continue
+            # Objeto alvo
             target = sample.current_target_object.strip().lower()
             with _target_object_lock:
                 if target != _target_object:
                     log.info("[DDS] Novo objeto alvo: '%s'", target)
                     _target_object = target
+            # Flag de ativacao
+            active = sample.active_modules.vision_objects
+            with _vision_active_lock:
+                if active != _vision_active:
+                    log.info("[DDS] vision_objects ativado: %s", active)
+                    _vision_active = active
         time.sleep(0.05)
 
 
@@ -492,6 +503,18 @@ def main():
             frame_viz_copy = frame_viz.copy()
             depth_raw_copy = depth_raw.copy()
             rgb_raw_copy   = rgb_raw.copy()
+
+            # Verificar se o orquestrador ativou a visao de objetos
+            with _vision_active_lock:
+                vision_on = _vision_active
+
+            if not vision_on:
+                cv2.putText(frame_viz_copy, "VISAO PAUSADA",
+                    (10, frame_viz_copy.shape[0] - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.imshow(WINDOW_NAME, frame_viz_copy)
+                cv2.waitKey(1)
+                continue
 
             frame_out = _run_inference(
                 rgb_raw   = rgb_raw_copy,
