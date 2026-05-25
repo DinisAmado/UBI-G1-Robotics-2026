@@ -126,7 +126,7 @@ log = logging.getLogger("navigation")
 MAP_SIZE = 200
 LOOP_DT = 0.02  # 50 Hz
 
-ENABLE_MOTION = False
+ENABLE_MOTION = True
 
 GOAL_TOLERANCE_M = 0.25
 WAYPOINT_TOLERANCE_M = 0.20
