@@ -412,7 +412,21 @@ class NavigationModule:
         self.w_path.write(NavPath(header=self.header("nav"), waypoints=waypoints))
 
     def send_cmd_vel(self, vx=0.0, vy=0.0, wz=0.0):
-        self.w_cmd_vel.write(CmdVel(header=self.header("nav"), vx=vx, vy=vy, wz=wz))
+        self.w_cmd_vel.write(
+            CmdVel(
+                header=self.header("nav"),
+                vx=vx,
+                vy=vy,
+                wz=wz,
+            )
+        )
+    
+        log.info(
+            "[CMD_VEL] vx=%.3f | vy=%.3f | wz=%.3f",
+            vx,
+            vy,
+            wz,
+        )
 
     def stop_robot(self):
         self.send_cmd_vel(0.0, 0.0, 0.0)
