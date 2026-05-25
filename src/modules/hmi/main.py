@@ -2,24 +2,24 @@
 """
 hri_funciona.py — Sistema HRI completo + integração com Orquestração
 Grupo 5 — Robótica Inteligente 2025/2026
-
+ 
 Fluxo: microfone ZMQ → VAD → Whisper → Classificador → FSM → Intent DDS + TTS + LEDs
 Publica:   rt/hmi/intent    (Intent)   — intenção do operador após confirmação
 Subscreve: rt/hmi/feedback  (Feedback) — estado da orquestração → TTS + LEDs
 """
-
+ 
 import os, re, sys, math, struct, asyncio, unicodedata
 import zmq, lz4.frame, wave, time, subprocess, logging
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import deque
-
+ 
 import pygame
 from faster_whisper import WhisperModel
 import edge_tts
 import webrtcvad
-
+ 
 # ── CycloneDDS (orquestração + Unitree SDK) ───────────────────────────────────
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
@@ -29,17 +29,24 @@ from cyclonedds.idl import IdlStruct, IdlEnum
 from cyclonedds.idl.types import sequence, uint8
 from cyclonedds.idl.annotations import key
 from enum import auto
-
+ 
 # ── Unitree SDK ───────────────────────────────────────────────────────────────
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-
+ 
+# ── Path para src/ (idl_ri.py e qos_profiles.py) ─────────────────────────────
+# Sobe 2 níveis: src/modules/2_hmi/ → src/modules/ → src/
+_pasta_atual = os.path.dirname(os.path.abspath(__file__))
+_pasta_src   = os.path.abspath(os.path.join(_pasta_atual, '..', '..'))
+if _pasta_src not in sys.path:
+    sys.path.insert(0, _pasta_src)
+ 
 # ── QoS e IDL da orquestração ─────────────────────────────────────────────────
 from qos_profiles import QOS_HMI
 from idl_ri import (
     Header, Intent, Acao, Feedback, Status, OrchestrationState,
 )
-
+ 
 log = logging.getLogger("hmi")
 
 # ==============================================================================
@@ -98,9 +105,9 @@ MAPA_ACAO = {
 }
 
 MAPA_TARGET = {
-    "BOLA_DE_TENIS":   "bola_de_tenis",
-    "CUBO_DE_RUBIK":   "cubo_de_rubik",
-    "PASTA_DE_DENTES": "pasta_de_dentes",
+    "BOLA_DE_TENIS":   "bola",   # nome que o grupo visão usa
+    "CUBO_DE_RUBIK":   "cubo",   # nome que o grupo visão usa
+    "PASTA_DE_DENTES": "pasta",  # nome que o grupo visão usa
     "NENHUM":          "",
     "DESCONHECIDO":    "",
 }
@@ -334,15 +341,12 @@ class LedController:
     def __init__(self, audio_client):
         self.audio_client = audio_client
         self.disponivel = audio_client is not None
-        self._cor_atual = None
 
     def set_color(self, r, g, b):
         if not self.disponivel: return
-        if self._cor_atual == (r, g, b): return  # evita chamadas redundantes
         try:
-            time.sleep(0.05)
             self.audio_client.LedControl(int(r), int(g), int(b))
-            self._cor_atual = (r, g, b)
+            time.sleep(0.15)  # tempo para o hardware reagir
         except Exception as e:
             print(f"[LEDS] Erro: {e}")
 
@@ -356,7 +360,7 @@ class LedController:
 
     def pendente(self):
         print("[LEDS] Laranja: a processar / pendente")
-        self.set_color(255, 80, 0)
+        self.set_color(255, 165, 0)  # laranja standard
 
     def cancelar(self):
         print("[LEDS] Vermelho: cancelado")
