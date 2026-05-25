@@ -443,10 +443,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="G1 Vision — ZMQ + YOLO + CycloneDDS")
     parser.add_argument("--robot-ip",   default="192.168.123.164")
-    parser.add_argument("--model-path", default=(
-        "/home/nova-lincs-04/unitree_sdk2_python/RI/3/"
-        "UBI-G1-Robotics-2026/src/modules/vision/robo/obj/best.pt"
-    ))
+    parser.add_argument("--model-path", default=("best.pt"))
     parser.add_argument(
         "--ema-alpha", type=float, default=EMA_ALPHA,
         help="Fator EMA [0=max. suave  1=sem filtro]  (default: 0.35)",
