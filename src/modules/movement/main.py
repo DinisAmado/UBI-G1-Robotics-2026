@@ -93,7 +93,9 @@ class MotionModule:
             self.last_cmd_time = time.time()
             log.info(f"COMANDO RECEBIDO -> [vx: {cmd.vx:.2f}, vy: {cmd.vy:.2f}, wz: {cmd.wz:.2f}] (Seq: {cmd.header.seq})")
             try:
-                self.loco_client.Move(cmd.vx, cmd.vy, cmd.wz)
+                self.loco_client.Move(cmd.vx, cmd.vy, cmd.wz, True)
+                log.info("COMANDO ENVIADO: Movimento enviado ao robô com sucesso.")
+
             except Exception as e:
                 log.error(f"ERRO EXECUÇÃO: Falha ao enviar movimento: {e}")
         else:
