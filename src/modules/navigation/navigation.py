@@ -205,8 +205,8 @@ def find_nearest_front_obstacle_goal(
 
     # Direção "frente" no referencial da grelha.
     # No código atual, x da grelha corresponde ao eixo vertical e y ao horizontal.
-    forward_x = math.cos(robot_yaw)
-    forward_y = math.sin(robot_yaw)
+    forward_x = math.sin(robot_yaw)
+    forward_y = math.cos(robot_yaw)
 
     best_obstacle = None
     best_dist = float("inf")
