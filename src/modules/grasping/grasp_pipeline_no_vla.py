@@ -206,6 +206,26 @@ class Custom:
         se3[:3, 3] = [x, y, z]
         return se3
 
+    def _camera_to_base(self, cam_xyz, cam_rpy_deg):
+        """
+        Converte posição E orientação do referencial câmara D435i para referencial base do robot.
+        cam_xyz: [x, y, z] no referencial câmara
+        cam_rpy_deg: [roll, pitch, yaw] em graus no referencial câmara
+        """
+        # transformação câmara→base (do URDF)
+        cam_pos_in_base = np.array([0.0576235, 0.01753, 0.42987])
+        R_cam_to_base = R.from_euler("xyz", [0, 0.8307767239493009, 0]).as_matrix()
+
+        # --- posição ---
+        obj_pos_in_base = R_cam_to_base @ np.array(cam_xyz) + cam_pos_in_base
+
+        # --- orientação ---
+        R_obj_in_cam = R.from_euler("xyz", cam_rpy_deg, degrees=True).as_matrix()
+        R_obj_in_base = R_cam_to_base @ R_obj_in_cam  # composição de rotações
+        rpy_in_base = R.from_matrix(R_obj_in_base).as_euler("xyz", degrees=True)
+
+        return obj_pos_in_base, rpy_in_base
+
     def _solve_ik_run(self, left_wrist: np.ndarray, right_wrist: np.ndarray, current_q=None) -> list:
         cmd = [
             "conda", "run", "-n", "g1_ik",
@@ -349,62 +369,82 @@ class Custom:
             self.next_state()
             time.sleep(2)
 
-        elif self.estado==1:
-            # ─── 1. Pose do objeto (recebes da câmara) ─────────────────────
-            # T_base_obj já transformada (câmara → base)
-            # Assumindo que já tens isto calculado antes
-            self.target_object_pose = self._pose_to_SE3([np.float64(0.083), np.float64(-0.066), np.float64(0.468), 7.15, -14.5, -25.14])
-            self.T_base_obj = self.target_object_pose  # 4x4 np.ndarray
+        elif self.estado == 1:
+            # ─── 1. Pose do objeto (câmara → base) ────────────────────────────
+            obj_pos, obj_rpy = self._camera_to_base(
+                [0.083, -0.066, 0.468],
+                [7.15, -14.5, -25.14]
+            )
+            self.target_object_pose = self._pose_to_SE3([*obj_pos, *obj_rpy])
+            self.T_base_obj = self.target_object_pose
 
-            # ─── 2. Calcula pré-grasp (sobe no Z do mundo) ─────────────────
+            # ─── 2. Calcula pré-grasp (sobe no Z do mundo) ────────────────────
             T_pregrasp = self.T_base_obj.copy()
             T_pregrasp[:3, 3] += np.array([0.0, 0.0, 0.15])  # 15cm acima
 
-            # ─── 3. IK para pré-grasp ──────────────────────────────────────
-            self.left_wrist = np.eye(4)  # braço esquerdo parado
+            # ─── 3. IK para pré-grasp ─────────────────────────────────────────
+            self.left_wrist = np.eye(4)
             q_current = [self.low_state.motor_state[j].q for j in range(15, 29)]
-
             pregrasp_joints = self._solve_ik_run(
                 self.left_wrist,
                 T_pregrasp,
                 current_q=np.array(q_current)
             )
-            right_pregrasp = pregrasp_joints[7:]  # só braço direito
+            right_pregrasp = pregrasp_joints[7:]
             self.pregrasp = right_pregrasp
             sla = input("Clica enter se ta tudo bem, agora vem o pregrasp prepara para o desastre")
             self.next_state()
 
-        elif self.estado==2:
+        elif self.estado == 2:
             print('AQUI VAI!!!')
-            # ─── 4. Move para pré-grasp ────────────────────────────────────
-            self.hand_r.grip(0.1)  # abre mão antes de mover
-            self.move_joints(self.pregrasp)
+            self.hand_r.grip(0.1)  # abre mão
+
+            # primeiro move para o pregrasp
+            self.move_joints(self.pregrasp, duration=6.0)
             time.sleep(1)
 
-            sla = input('Clica enter para ver se ta tudo bem, Calculo do IK grasp')
+            # só depois vira a palma para baixo
+            self.move_joints([
+                (G1JointIndex.RightWristRoll,  0.0),
+                (G1JointIndex.RightWristPitch, -1.57),
+                (G1JointIndex.RightWristYaw,   0.0),
+            ], duration=1.0)
+
+            sla = input('Clica enter para ver se ta tudo bem')
             self.next_state()
-        elif self.estado==3:
+        
+        elif self.estado == 3:
             print('Calma agora matemática brinca')
-            # ─── 5. IK para grasp (parte do pré-grasp!) ────────────────────
             q_at_pregrasp = [self.low_state.motor_state[j].q for j in range(15, 29)]
 
-
             T_grasp = self.T_base_obj.copy()
-            T_grasp[:3, 3] += np.array([0.0, 0.0, 0.06])  # 15cm acima
+            T_grasp[:3, 3] += np.array([0.0, 0.0, 0.06])
 
             grasp_joints = self._solve_ik_run(
                 self.left_wrist,
                 T_grasp,
-                current_q=np.array(q_at_pregrasp)  # começa perto!
+                current_q=np.array(q_at_pregrasp)
             )
-            right_grasp = grasp_joints[7:]
-            self.grasp = right_grasp
+            right_grasp = grasp_joints[7:]  # [(22, q), (23, q), ...]
+
+            # força o pulso para palma para baixo, ignorando o que o IK calculou
+            wrist_override = {
+                26: 0.0,    # RightWristRoll  — ajusta conforme calibração
+                27: -1.57,  # RightWristPitch
+                28: 0.0,    # RightWristYaw
+            }
+            self.grasp = [
+                (idx, wrist_override[idx]) if idx in wrist_override else (idx, q)
+                for idx, q in right_grasp
+            ]
+
             sla = input('Clica enter para ver se ta tudo bem, agora vai o grasp')
             self.next_state()
+
         elif  self.estado==4:
             print('AQUI VAI!!! AGAINNNNN!!!')
             # ─── 6. Desce devagar para o objeto ────────────────────────────
-            self.move_joints(self.grasp, duration=3.0)  # mais lento
+            self.move_joints(self.grasp, duration=6.0)  # mais lento
             time.sleep(0.5)
 
             # ─── 7. Fecha mão ──────────────────────────────────────────────
