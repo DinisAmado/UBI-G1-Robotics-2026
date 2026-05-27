@@ -279,6 +279,33 @@ class Custom:
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.arm_sdk_publisher.Write(self.low_cmd)
 
+    # adiciona este método à classe Custom
+    def _camera_to_base(self, pose: Pose6DOF):
+        """Converte Pose6DOF do referencial câmara D435i para referencial base."""
+        cam_pos_in_base = np.array([0.0576235, 0.01753, 0.42987])
+    
+        # D435i: x=direita, y=baixo, z=profundidade
+        # Base:  x=frente,  y=esquerda, z=cima
+        x_base = pose.z    # profundidade → frente
+        y_base = -pose.x   # direita → esquerda
+        z_base = -pose.y   # baixo → cima
+    
+        obj_pos_cam = np.array([x_base, y_base, z_base])
+    
+        # pitch negativo — câmara aponta para baixo
+        R_cam_to_base = R.from_euler("xyz", [0, -0.8307767239493009, 0]).as_matrix()
+        obj_pos_in_base = R_cam_to_base @ obj_pos_cam + cam_pos_in_base
+    
+        # orientação
+        R_obj_in_cam = R.from_euler("xyz", [pose.roll, pose.pitch, pose.yaw]).as_matrix()
+        R_obj_in_base = R_cam_to_base @ R_obj_in_cam
+        rpy_in_base = R.from_matrix(R_obj_in_base).as_euler("xyz")
+    
+        se3 = np.eye(4)
+        se3[:3, :3] = R.from_euler("xyz", rpy_in_base).as_matrix()
+        se3[:3, 3]  = obj_pos_in_base
+        return se3
+
     def move_joints(self, targets: list, duration: float = 2.0):
         if self.low_state is None:
             log.warning('move_joints: low_state não disponível')
@@ -587,14 +614,15 @@ class Custom:
 
             if cmd.objeto_id == '':
                 try:
-                    self.target_object_pose = self._pose6dof_to_SE3(cmd.pose)
-                    log.info('Pose do objeto: x=%.3f y=%.3f z=%.3f r=%.3f p=%.3f y=%.3f',
-                             cmd.pose.x, cmd.pose.y, cmd.pose.z,
-                             cmd.pose.roll, cmd.pose.pitch, cmd.pose.yaw)
-                except Exception as e:
-                    log.error('Erro ao ler pose: %s', e)
-                    self.comms.report_status(Status.FAILED, reason=f'bad_pose:{e}')
-                    return
+                  self.target_object_pose = self._camera_to_base(cmd.pose)
+                  log.info('Pose no referencial base: x=%.3f y=%.3f z=%.3f',
+                           self.target_object_pose[0, 3],
+                           self.target_object_pose[1, 3],
+                           self.target_object_pose[2, 3])
+              except Exception as e:
+                  log.error('Erro ao ler pose: %s', e)
+                  self.comms.report_status(Status.FAILED, reason=f'bad_pose:{e}')
+                  return
                 self.comms.report_status(Status.RUNNING, reason='grasp_started', progress=0.0)
                 self.estado = STATE_INIT_POS
 
