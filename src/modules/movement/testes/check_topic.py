@@ -1,28 +1,17 @@
-# descobrir_topicos.py
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+# ver_todos_topicos.py
+from cyclonedds.domain import DomainParticipant
+from cyclonedds.builtin import BuiltinDataReader, BuiltinTopicDcpsPublication
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 import time
 
 ChannelFactoryInitialize(0, "enp117s0")
+time.sleep(0.5)
 
-candidatos = [
-    "rt/sportmodestate",
-    "rt/lf/sportmodestate",
-    "rt/loco/sportmodestate",
-    "rt/sportmode/state",
-]
+dp = DomainParticipant(0)
+rd = BuiltinDataReader(dp, BuiltinTopicDcpsPublication)
+time.sleep(3)
 
-def make_cb(nome):
-    def cb(msg):
-        print(f"✅ TÓPICO ATIVO: {nome}")
-        print(f"   pos=({msg.position[0]:.3f}, {msg.position[1]:.3f})")
-        print(f"   vel=({msg.velocity[0]:.3f}, {msg.velocity[1]:.3f})")
-    return cb
-
-for t in candidatos:
-    s = ChannelSubscriber(t, SportModeState_)
-    s.Init(make_cb(t), 5)
-    print(f"A escutar: {t}")
-
-time.sleep(5)
-print("Feito.")
+topicos = rd.take()
+print(f"\n{len(topicos)} tópico(s) encontrado(s):\n")
+for t in sorted(topicos, key=lambda x: x.topic_name):
+    print(f"  {t.topic_name:<45} | {t.type_name}")
