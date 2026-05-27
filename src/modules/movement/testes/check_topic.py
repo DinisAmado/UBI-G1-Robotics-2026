@@ -1,27 +1,34 @@
+# testar_lowstate.py
 import os
 os.environ["CYCLONEDDS_URI"] = """
-<CycloneDDS>
-  <Domain>
-    <General>
-      <NetworkInterfaceAddress>enp117s0</NetworkInterfaceAddress>
-    </General>
-  </Domain>
-</CycloneDDS>
+<CycloneDDS><Domain><General>
+  <NetworkInterfaceAddress>enp117s0</NetworkInterfaceAddress>
+</General></Domain></CycloneDDS>
 """
 
-from cyclonedds.domain import DomainParticipant
-from cyclonedds.builtin import BuiltinDataReader, BuiltinTopicDcpsPublication
-from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
 import time
 
 ChannelFactoryInitialize(0, "enp117s0")
-time.sleep(0.5)
 
-dp = DomainParticipant(0)
-rd = BuiltinDataReader(dp, BuiltinTopicDcpsPublication)
-time.sleep(3)
+dados = {"recebido": False}
 
-topicos = rd.take()
-print(f"\n{len(topicos)} tópico(s) encontrado(s):\n")
-for t in sorted(topicos, key=lambda x: x.topic_name):
-    print(f"  {t.topic_name:<45} | {t.type_name}")
+def cb(msg):
+    if not dados["recebido"]:
+        dados["recebido"] = True
+        imu = msg.imu_state
+        print(f"✅ LowState_ recebido!")
+        print(f"   quaternion : {list(imu.quaternion)}")
+        print(f"   gyroscope  : {list(imu.gyroscope)}")
+        print(f"   rpy        : {list(imu.rpy)}")
+
+subs = []
+for topico in ["rt/lf/lowstate", "rt/lowstate"]:
+    s = ChannelSubscriber(topico, LowState_)
+    s.Init(cb, 10)
+    subs.append(s)
+    print(f"A escutar: {topico}")
+
+time.sleep(5)
+print("Feito." if not dados["recebido"] else "")
