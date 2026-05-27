@@ -1,4 +1,14 @@
-# ver_todos_topicos.py
+import os
+os.environ["CYCLONEDDS_URI"] = """
+<CycloneDDS>
+  <Domain>
+    <General>
+      <NetworkInterfaceAddress>enp117s0</NetworkInterfaceAddress>
+    </General>
+  </Domain>
+</CycloneDDS>
+"""
+
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.builtin import BuiltinDataReader, BuiltinTopicDcpsPublication
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
