@@ -54,7 +54,7 @@ from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 
 # ── Hand control ──────────────────────────────────────────────────────────────
-from hand_control import HandControl
+from hand_grasp_control import Dex3SmartController # HandControl
 
 # ── CycloneDDS ───────────────────────────────────────────────────────────────
 from cyclonedds.domain import DomainParticipant
@@ -265,7 +265,7 @@ class Custom:
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 10)
 
-        self.hand_r = HandControl("R")
+        self.hand_r = Dex3SmartController("R")
         log.info('Custom.Init() concluído')
 
     def Start(self):
@@ -308,6 +308,31 @@ class Custom:
         """Calcula CRC e publica o low_cmd actual."""
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.arm_sdk_publisher.Write(self.low_cmd)
+
+    def _camera_to_base(self, cam_xyz, cam_rpy_deg):
+        # transformação câmara→base (do URDF)
+        cam_pos_in_base = np.array([0.0576235, 0.01753, 0.42987])
+
+        # D435i: x=direita, y=baixo, z=profundidade
+        # Base:  x=frente,  y=esquerda, z=cima
+        x_cam, y_cam, z_cam = cam_xyz
+        x_base = z_cam  # profundidade → frente
+        y_base = -x_cam  # direita → esquerda
+        z_base = -y_cam  # baixo → cima
+
+        obj_pos_cam_corrigido = np.array([x_base, y_base, z_base])
+
+        # aplica pitch da câmara (~47.6° para baixo)
+        R_cam_to_base = R.from_euler("xyz", [0, 0.8307767239493009, 0]).as_matrix()
+        obj_pos_in_base = R_cam_to_base @ obj_pos_cam_corrigido + cam_pos_in_base
+
+        # orientação
+        R_obj_in_cam = R.from_euler("xyz", cam_rpy_deg).as_matrix()
+        R_obj_in_base = R_cam_to_base @ R_obj_in_cam
+        rpy_in_base = R.from_matrix(R_obj_in_base).as_euler("xyz", degrees=True)
+
+        return obj_pos_in_base, rpy_in_base
+
 
     def move_joints(self, targets: list, duration: float = 2.0):
         """
@@ -379,6 +404,22 @@ class Custom:
 
         raise RuntimeError(f'Sem JSON no stdout:\n{result.stdout}')
 
+    def _get_fk(self, q_current):
+        cmd = [
+            "conda", "run", "-n", "g1_ik",
+            "python", "run_fk.py",
+            "--current_q", json.dumps(q_current.tolist()),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FK subprocess failed:\n{result.stderr}")
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                data = json.loads(line)
+                return np.array(data["left"]), np.array(data["right"])
+        raise RuntimeError(f"No JSON found:\n{result.stdout}")
+
     # ─────────────────────────────────────────────────────────────────────────
     # Sequências de acção
     # ─────────────────────────────────────────────────────────────────────────
@@ -413,37 +454,52 @@ class Custom:
         log.info('[Estado 1] GRASPING...')
         self.comms.report_status(Status.RUNNING, reason='grasping', progress=0.3)
 
-        T_obj      = self.target_object_pose
-        left_wrist = np.eye(4)            # braço esquerdo parado
+        obj_pos, obj_rpy = self._camera_to_base(
+            [0.083, -0.066, 0.468],
+            [7.15, -14.5, -25.14]
+        )
+        self.target_object_pose = self._pose_to_SE3([*obj_pos, *obj_rpy])
+        T_base_obj = self.target_object_pose
+
+        q_current = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
+        left_wrist, _ = self._get_fk(q_current)
+
 
         # ── pré-grasp: 15 cm à frente no eixo Y do mundo ──────────────────
-        T_pregrasp         = T_obj.copy()
-        T_pregrasp[:3, 3] += np.array([0.0, 0.15, 0.0])
+        T_pregrasp         = T_base_obj.copy()
+        T_pregrasp[:3, 3] += np.array([0.0, 0.0, 0.15])  # 15 cm acima do objeto
 
-        q_current = np.array(
-            [self.low_state.motor_state[j].q for j in range(15, 29)]
-        )
+
         pregrasp_joints = self._solve_ik_run(left_wrist, T_pregrasp, q_current)
-        right_pregrasp  = pregrasp_joints[7:]        # só braço direito
+        wrist_override = {26: 0.0, 27: 1.57, 28: 0.0}
+        right_pregrasp = [
+            (idx, wrist_override[idx]) if idx in wrist_override else (idx, q)
+            for idx, q in pregrasp_joints[7:]
+        ]                                         # só braço direito
 
-        self.hand_r.grip(0.1)                        # abre mão antes de mover
+        self.hand_r.open_gradually()                        # abre mão antes de mover
         self.move_joints(right_pregrasp, duration=3.0)
         time.sleep(1.0)
         self.comms.report_status(Status.RUNNING, reason='pregrasp_done', progress=0.5)
 
         # ── grasp: parte do pré-grasp para reduzir saltos de IK ───────────
-        q_at_pregrasp = np.array(
-            [self.low_state.motor_state[j].q for j in range(15, 29)]
-        )
-        grasp_joints = self._solve_ik_run(left_wrist, T_obj, q_at_pregrasp)
+        q_current = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
+        left_wrist, _ = self._get_fk(q_current)
+
+        T_grasp = T_base_obj.copy()
+        T_grasp[:3, 3] += np.array([0.0, 0.0, 0.06])
+
+        grasp_joints = self._solve_ik_run(left_wrist, T_grasp, q_current)
         right_grasp  = grasp_joints[7:]
 
         self.move_joints(right_grasp, duration=6.0)  # lento para precisão
         time.sleep(0.5)
 
         # ── fecha mão ─────────────────────────────────────────────────────
-        self.hand_r.grip(0.8)
-        time.sleep(0.8)                              # deixa estabilizar
+        agarrou = self.hand_r.diagnostic_close()
+        if not agarrou:
+            print("Não agarrou nada! Tentando oura vez...")
+            time.sleep(0.8)                              # deixa estabilizar
 
         log.info('[Estado 1] Grasp concluído → LIFT')
         self.comms.report_status(Status.RUNNING, reason='grasp_done', progress=0.7)
@@ -490,7 +546,7 @@ class Custom:
         self.comms.report_status(Status.RUNNING, reason='releasing', progress=0.1)
 
         # 1. Abre mão devagar para não atirar o objecto
-        self.hand_r.grip(0.1)
+        self.hand_r.open_gradually()
         time.sleep(1.2)
         self.comms.report_status(Status.RUNNING, reason='hand_open', progress=0.5)
 

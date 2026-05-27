@@ -143,7 +143,7 @@ class Dex3SmartController:
                     # BACK OFF slightly to release pressure
                     self.grip_value = max(0.0, self.grip_value - 0.02)
                     self.send_cmd(self.grip_value, kp=3.0)
-                    return
+                    return True
 
             # 2. Advance Grip
             self.grip_value = min(1.0, round(self.grip_value + GRIP_STEP, 3))
@@ -163,6 +163,7 @@ class Dex3SmartController:
             steps_taken += 1
             
         print("\n[STATUS] Fully closed (no object detected).")
+        return False
 
     def close_with_force_stop(self):
         print(f"\n[ACTION] Closing {self.side} hand... monitoring force limits.")

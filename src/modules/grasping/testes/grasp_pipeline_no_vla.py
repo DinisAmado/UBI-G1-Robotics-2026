@@ -207,21 +207,25 @@ class Custom:
         return se3
 
     def _camera_to_base(self, cam_xyz, cam_rpy_deg):
-        """
-        Converte posição E orientação do referencial câmara D435i para referencial base do robot.
-        cam_xyz: [x, y, z] no referencial câmara
-        cam_rpy_deg: [roll, pitch, yaw] em graus no referencial câmara
-        """
         # transformação câmara→base (do URDF)
         cam_pos_in_base = np.array([0.0576235, 0.01753, 0.42987])
+
+        # D435i: x=direita, y=baixo, z=profundidade
+        # Base:  x=frente,  y=esquerda, z=cima
+        x_cam, y_cam, z_cam = cam_xyz
+        x_base = z_cam  # profundidade → frente
+        y_base = -x_cam  # direita → esquerda
+        z_base = -y_cam  # baixo → cima
+
+        obj_pos_cam_corrigido = np.array([x_base, y_base, z_base])
+
+        # aplica pitch da câmara (~47.6° para baixo)
         R_cam_to_base = R.from_euler("xyz", [0, 0.8307767239493009, 0]).as_matrix()
+        obj_pos_in_base = R_cam_to_base @ obj_pos_cam_corrigido + cam_pos_in_base
 
-        # --- posição ---
-        obj_pos_in_base = R_cam_to_base @ np.array(cam_xyz) + cam_pos_in_base
-
-        # --- orientação ---
-        R_obj_in_cam = R.from_euler("xyz", cam_rpy_deg, degrees=True).as_matrix()
-        R_obj_in_base = R_cam_to_base @ R_obj_in_cam  # composição de rotações
+        # orientação
+        R_obj_in_cam = R.from_euler("xyz", cam_rpy_deg).as_matrix()
+        R_obj_in_base = R_cam_to_base @ R_obj_in_cam
         rpy_in_base = R.from_matrix(R_obj_in_base).as_euler("xyz", degrees=True)
 
         return obj_pos_in_base, rpy_in_base
@@ -248,6 +252,22 @@ class Custom:
         if json_line is None:
             raise RuntimeError(f"No JSON found in stdout:\n{result.stdout}\nSTDERR:\n{result.stderr}")
         return [tuple(pair) for pair in json.loads(json_line)]
+
+    def _get_fk(self, q_current):
+        cmd = [
+            "conda", "run", "-n", "g1_ik",
+            "python", "run_fk.py",
+            "--current_q", json.dumps(q_current.tolist()),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"FK subprocess failed:\n{result.stderr}")
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                data = json.loads(line)
+                return np.array(data["left"]), np.array(data["right"])
+        raise RuntimeError(f"No JSON found:\n{result.stdout}")
 
     def move_joints(self, targets, duration=2.0):
         """
@@ -366,6 +386,8 @@ class Custom:
             # Mover os braços para posição inicial
             Move = MovementConfigs.ArmStandardPosition
             self.move_joints(Move)
+            time.sleep(1)
+            Move
             self.next_state()
             time.sleep(2)
 
@@ -383,14 +405,21 @@ class Custom:
             T_pregrasp[:3, 3] += np.array([0.0, 0.0, 0.15])  # 15cm acima
 
             # ─── 3. IK para pré-grasp ─────────────────────────────────────────
-            self.left_wrist = np.eye(4)
-            q_current = [self.low_state.motor_state[j].q for j in range(15, 29)]
+            q_current = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
+            self.left_wrist, _ = self._get_fk(q_current)
+
             pregrasp_joints = self._solve_ik_run(
                 self.left_wrist,
                 T_pregrasp,
                 current_q=np.array(q_current)
             )
             right_pregrasp = pregrasp_joints[7:]
+            print("Juntas pregrasp direito:")
+            joint_names = {22: "ShoulderPitch", 23: "ShoulderRoll", 24: "ShoulderYaw", 25: "Elbow", 26: "WristRoll",
+                           27: "WristPitch", 28: "WristYaw"}
+            for idx, q in right_pregrasp:
+                print(f"  {joint_names[idx]} ({idx}): {q:.3f} rad ({np.degrees(q):.1f}°)")
+
             self.pregrasp = right_pregrasp
             sla = input("Clica enter se ta tudo bem, agora vem o pregrasp prepara para o desastre")
             self.next_state()
@@ -406,7 +435,7 @@ class Custom:
             # só depois vira a palma para baixo
             self.move_joints([
                 (G1JointIndex.RightWristRoll,  0.0),
-                (G1JointIndex.RightWristPitch, -1.57),
+                (G1JointIndex.RightWristPitch, 1.57),
                 (G1JointIndex.RightWristYaw,   0.0),
             ], duration=1.0)
 
@@ -415,22 +444,24 @@ class Custom:
         
         elif self.estado == 3:
             print('Calma agora matemática brinca')
-            q_at_pregrasp = [self.low_state.motor_state[j].q for j in range(15, 29)]
 
             T_grasp = self.T_base_obj.copy()
             T_grasp[:3, 3] += np.array([0.0, 0.0, 0.06])
 
+            q_current = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
+            self.left_wrist, _ = self._get_fk(q_current)
+
             grasp_joints = self._solve_ik_run(
                 self.left_wrist,
                 T_grasp,
-                current_q=np.array(q_at_pregrasp)
+                current_q=np.array(q_current)
             )
             right_grasp = grasp_joints[7:]  # [(22, q), (23, q), ...]
 
             # força o pulso para palma para baixo, ignorando o que o IK calculou
             wrist_override = {
                 26: 0.0,    # RightWristRoll  — ajusta conforme calibração
-                27: -1.57,  # RightWristPitch
+                27: 1.57,  # RightWristPitch
                 28: 0.0,    # RightWristYaw
             }
             self.grasp = [
