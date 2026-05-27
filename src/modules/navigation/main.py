@@ -686,8 +686,9 @@ class NavigationModule:
 
         now = time.time()
 
-        if now - self.last_replan_time < REPLAN_INTERVAL_S and self.current_path:
-            return
+        if self.navigation_active and self.current_goal_cell is not None:
+            if self.current_path and self.slam.is_path_valid(self.current_path):
+                return
 
         robot_cell = self.current_robot_cell()
 
