@@ -4,7 +4,7 @@ grasp_control.py
 Integração completa: CycloneDDS + controlo de braços G1
 
 Comandos suportados (via tópico rt/grasp/command):
-  - postura=EXTEND_ARM_FORWARD, objeto_id=''         → "apanhar objeto"   (estados 0→1→2)
+  - postura=EXTEND_ARM_FORWARD, objeto_id=''         → "apanhar objeto"   (estados 1→2)
   - postura=EXTEND_ARM_FORWARD, objeto_id='carry'    → "modo transporte"  (estado 3)
   - postura=EXTEND_ARM_FORWARD, objeto_id='deliver'  → "entregar objeto"  (estado 4)
   - postura=NEUTRAL,            objeto_id='drop'     → "largar imediato"  (estado 5)
@@ -209,7 +209,8 @@ class Custom:
         self.crc  = CRC()
         self.done = False
 
-        self.estado: int = STATE_IDLE
+        # Alteração: Arranca e vai direto preparar o braço na posição Standard
+        self.estado: int = STATE_INIT_POS
 
         self.target_object_pose: np.ndarray | None = None
 
@@ -380,18 +381,19 @@ class Custom:
     # Sequências de acção
     # ─────────────────────────────────────────────────────────────────────────
     def _do_init_position(self):
-        """Estado 0 — move para posição padrão."""
-        if self._processing:  # Guarda em processamento (re-adicionada)
+        """Estado 0 — move para posição padrão no arranque e fica IDLE."""
+        if self._processing:  
             return
         self._processing = True
         
-        log.info('[Estado 0] INIT_POSITION')
+        log.info('[Estado 0] INIT_POSITION (A levantar braço para posição de prontidão)')
         self.comms.report_status(Status.RUNNING, reason='init_position', progress=0.1)
 
         self.move_joints(MovementConfigs.ArmStandardPosition, duration=3.0)
 
-        self.comms.report_status(Status.RUNNING, reason='init_done', progress=0.2)
-        self.estado = STATE_GRASPING
+        self.comms.report_status(Status.DONE, reason='init_done', progress=1.0)
+        # Alteração: Fica IDLE à espera, o braço já está na posição ideal!
+        self.estado = STATE_IDLE
         
         self._processing = False
 
@@ -407,7 +409,7 @@ class Custom:
             self._processing = False
             return
 
-        log.info('[Estado 1] GRASPING')
+        log.info('[Estado 1] GRASPING (O braço já está na posição inicial, a atacar objeto)')
         self.comms.report_status(Status.RUNNING, reason='grasping', progress=0.3)
 
         T_obj = self.target_object_pose
@@ -602,7 +604,8 @@ class Custom:
                     return
                 
                 self.comms.report_status(Status.RUNNING, reason='grasp_started', progress=0.0)
-                self.estado = STATE_INIT_POS
+                # Alteração: Salta direto para o Grasp (o braço já está levantado!)
+                self.estado = STATE_GRASPING
 
             elif cmd.objeto_id == 'carry':
                 self.comms.report_status(Status.RUNNING, reason='carry_started', progress=0.0)
@@ -629,7 +632,8 @@ class Custom:
 # Ponto de entrada
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print('AVISO: Certifica-te de que não há obstáculos à volta do robô.')
+    print('AVISO: O robô vai mover o braço para a posição inicial mal pressiones Enter!')
+    print('Certifica-te de que não há obstáculos à volta do robô.')
     input('Pressiona Enter para continuar...\n')
 
     ChannelFactoryInitialize(0, 'enp117s0')
