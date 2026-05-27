@@ -32,7 +32,6 @@ from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
 # ── Hand control ──────────────────────────────────────────────────────────────
-# ALTERAÇÃO 1: substituído HandControl por Dex3SmartController (tem diagnostic_close)
 from Hand_grasp_control import Dex3SmartController
 
 # ── CycloneDDS ───────────────────────────────────────────────────────────────
@@ -82,15 +81,11 @@ STATE_DROPPING   =  5
 # ─────────────────────────────────────────────────────────────────────────────
 class MovementConfigs:
 
-    # ALTERAÇÃO 2: ArmStandardPosition atualizado para a nova pose calibrada
-    # (só braço direito — braço esquerdo é mantido fixo pelo _fix_left_arm)
     ArmStandardPosition = [
         (22, -0.1107), (23, -0.6342), (24,  0.1358), (25, -0.2556),
         (26,  0.2811), (27, -0.4448), (28, -0.1961),
     ]
 
-    # ALTERAÇÃO 3: Pulso_pos define a orientação correta da palma para agarrar
-    # (26=WristRoll, 28=WristYaw) — calculado experimentalmente
     Pulso_pos = [(26, 0.0765), (28, 0.0884)]
 
     RightArmUP1Position = [
@@ -222,7 +217,6 @@ class Custom:
         self.left_init  = None
         self.right_init = None
 
-        # ALTERAÇÃO 4: flag para evitar re-entrar nos estados que chamam subprocessos
         self._processing = False
 
         self.comms = GraspComms()
@@ -237,7 +231,6 @@ class Custom:
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self.LowStateHandler, 10)
 
-        # ALTERAÇÃO 5: usa Dex3SmartController em vez de HandControl
         self.hand_r = Dex3SmartController("R")
         log.info('Custom.Init() concluído')
 
@@ -279,7 +272,6 @@ class Custom:
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.arm_sdk_publisher.Write(self.low_cmd)
 
-    # adiciona este método à classe Custom
     def _camera_to_base(self, pose: Pose6DOF):
         """Converte Pose6DOF do referencial câmara D435i para referencial base."""
         cam_pos_in_base = np.array([0.0576235, 0.01753, 0.42987])
@@ -368,8 +360,6 @@ class Custom:
 
         raise RuntimeError(f'Sem JSON no stdout:\n{result.stdout}')
 
-    # ALTERAÇÃO 6: método _get_fk adicionado — calcula FK do braço esquerdo
-    # para passar como target ao IK (evita que o braço esquerdo se mova)
     def _get_fk(self, q_current: np.ndarray):
         cmd = [
             'conda', 'run', '-n', 'g1_ik',
@@ -391,23 +381,21 @@ class Custom:
     # ─────────────────────────────────────────────────────────────────────────
     def _do_init_position(self):
         """Estado 0 — move para posição padrão."""
+        if self._processing:  # Guarda em processamento (re-adicionada)
+            return
+        self._processing = True
+        
         log.info('[Estado 0] INIT_POSITION')
         self.comms.report_status(Status.RUNNING, reason='init_position', progress=0.1)
 
-        # ALTERAÇÃO 7: usa nova ArmStandardPosition calibrada
         self.move_joints(MovementConfigs.ArmStandardPosition, duration=3.0)
 
         self.comms.report_status(Status.RUNNING, reason='init_done', progress=0.2)
         self.estado = STATE_GRASPING
+        
+        self._processing = False
 
     def _do_grasping(self):
-        """
-        Estado 1 — IK pré-grasp → pulso → desce → fecha mão.
-        ALTERAÇÃO 8: usa _get_fk para o braço esquerdo ficar parado;
-        separa movimento em fase 1 (ombro/cotovelo) + fase 2 (pulso);
-        usa Pulso_pos para orientação correta da palma;
-        usa diagnostic_close para detetar se agarrou.
-        """
         if self._processing:
             return
         self._processing = True
@@ -424,38 +412,32 @@ class Custom:
 
         T_obj = self.target_object_pose
 
-        # pré-grasp: 15 cm acima no Z do mundo
         T_pregrasp         = T_obj.copy()
         T_pregrasp[:3, 3] += np.array([0.0, 0.0, 0.15])
 
         q_current = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
 
-        # FK do braço esquerdo → mantém-no parado durante o IK
         self.left_wrist, _ = self._get_fk(q_current)
 
         pregrasp_joints = self._solve_ik_run(self.left_wrist, T_pregrasp, q_current)
         right_pregrasp  = pregrasp_joints[7:]
 
-        # fase 1 — ombro e cotovelo
         phase1 = [(idx, q) for idx, q in right_pregrasp if idx in [22, 23, 24, 25]]
         self.hand_r.open_gradually()
         self.move_joints(phase1, duration=6.0)
         time.sleep(0.5)
 
-        # fase 2 — pulso para orientação correta (Pulso_pos)
         self.move_joints(MovementConfigs.Pulso_pos, duration=4.0)
         time.sleep(1.0)
 
         self.comms.report_status(Status.RUNNING, reason='pregrasp_done', progress=0.5)
 
-        # grasp final — começa do pré-grasp com pulso já correto
         q_at_pregrasp = np.array([self.low_state.motor_state[j].q for j in range(15, 29)])
         self.left_wrist, _ = self._get_fk(q_at_pregrasp)
 
         grasp_joints = self._solve_ik_run(self.left_wrist, T_obj, q_at_pregrasp)
         right_grasp  = grasp_joints[7:]
 
-        # mantém pulso na orientação correta também no grasp
         wrist_override = {
             26: dict(MovementConfigs.Pulso_pos)[26],
             28: dict(MovementConfigs.Pulso_pos)[28],
@@ -468,7 +450,6 @@ class Custom:
         self.move_joints(right_grasp_final, duration=6.0)
         time.sleep(0.5)
 
-        # fecha mão com deteção de força
         agarrou = self.hand_r.diagnostic_close()
         if not agarrou:
             log.warning('[Estado 1] Não agarrou nada — a voltar ao início')
@@ -485,7 +466,6 @@ class Custom:
         self._processing = False
 
     def _do_lift(self):
-        """Estado 2 — levanta o braço. Mão permanece fechada."""
         if self._processing:
             return
         self._processing = True
@@ -500,7 +480,6 @@ class Custom:
         self._processing = False
 
     def _do_carry(self):
-        """Estado 3 — braço em posição neutra de transporte. Mão fechada."""
         if self._processing:
             return
         self._processing = True
@@ -515,7 +494,6 @@ class Custom:
         self._processing = False
 
     def _do_delivering(self):
-        """Estado 4 — estica braço para frente e abre garra para entregar."""
         if self._processing:
             return
         self._processing = True
@@ -532,7 +510,6 @@ class Custom:
         self._processing = False
 
     def _do_dropping(self):
-        """Estado 5 — abre mão imediatamente (drop de emergência)."""
         if self._processing:
             return
         self._processing = True
@@ -614,15 +591,16 @@ class Custom:
 
             if cmd.objeto_id == '':
                 try:
-                  self.target_object_pose = self._camera_to_base(cmd.pose)
-                  log.info('Pose no referencial base: x=%.3f y=%.3f z=%.3f',
-                           self.target_object_pose[0, 3],
-                           self.target_object_pose[1, 3],
-                           self.target_object_pose[2, 3])
-              except Exception as e:
-                  log.error('Erro ao ler pose: %s', e)
-                  self.comms.report_status(Status.FAILED, reason=f'bad_pose:{e}')
-                  return
+                    self.target_object_pose = self._camera_to_base(cmd.pose)
+                    log.info('Pose no referencial base: x=%.3f y=%.3f z=%.3f',
+                             self.target_object_pose[0, 3],
+                             self.target_object_pose[1, 3],
+                             self.target_object_pose[2, 3])
+                except Exception as e:
+                    log.error('Erro ao ler pose: %s', e)
+                    self.comms.report_status(Status.FAILED, reason=f'bad_pose:{e}')
+                    return
+                
                 self.comms.report_status(Status.RUNNING, reason='grasp_started', progress=0.0)
                 self.estado = STATE_INIT_POS
 

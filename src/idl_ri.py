@@ -109,7 +109,7 @@ class ObjectDetection(IdlStruct, typename="rt.vision.ObjectDetection"):
     """A visão publica a pose 6-DOF do objeto em vez da imagem."""
     name:       str      = ""
     confidence: float    = 0.0
-    pose:       Pose6DOF = field(default_factory=Pose6DOF)   # ← era Image
+    pose:       Pose6DOF = field(default_factory=Pose6DOF)
 
 
 @dataclass
@@ -122,7 +122,7 @@ class Objects(IdlStruct, typename="rt.vision.Objects"):
 class PersonDetection(IdlStruct, typename="rt.vision.PersonDetection"):
     id:                      str   = ""
     lip_movement_confidence: float = 0.0
-    yaw:                     float = 0.0   # ← novo: orientação da pessoa (rad)
+    yaw:                     float = 0.0
 
 
 @dataclass
@@ -136,23 +136,14 @@ class Persons(IdlStruct, typename="rt.vision.Persons"):
 class Posture(IdlEnum):
     EXTEND_ARM_FORWARD = auto()   # estender braço para agarrar ou entregar
     NEUTRAL            = auto()   # braço recolhido para transporte
-    READY_TO_RECEIVE   = auto()   # braço preparado para receber objeto
-
-
-# Semântica de objeto_id em GraspCommand:
-#   ""         → agarrar o objeto indicado em `objeto`
-#   "carry"    → modo transporte (braço neutro com objeto na mão)
-#   "deliver"  → entregar à pessoa (abrir garra)
-#   "drop"     → largar imediatamente (falha/recuperação)
-#   "shutdown" → desligar módulo de grasping
 
 
 @dataclass
 class GraspCommand(IdlStruct, typename="rt.grasp.Command"):
     header:    Header   = field(default_factory=Header)
     objeto:    str      = ""
-    objeto_id: str      = ""       # ver semântica acima
-    pose:      Pose6DOF = field(default_factory=Pose6DOF)   # ← era Image
+    objeto_id: str      = ""       
+    pose:      Pose6DOF = field(default_factory=Pose6DOF)   
     postura:   Posture  = Posture.NEUTRAL
 
 

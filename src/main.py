@@ -38,33 +38,23 @@ log = logging.getLogger("orchestrator")
 # ─── Constantes ──────────────────────────────────────────────────────────────
 
 DOMAIN_ID        = 0
-MAX_RETRIES      = 3      # tentativas por fase antes de ABORTED
-LOOP_HZ          = 20     # frequência do loop principal
-VISION_MIN_CONF  = 0.6    # confiança mínima para aceitar uma detecção de objecto
+MAX_RETRIES      = 3      
+LOOP_HZ          = 20     
+VISION_MIN_CONF  = 0.6    
 
-# Timeouts por fase (segundos).
-# Se uma fase ultrapassar este tempo sem avançar, entra no ciclo de retry.
-# Fases sem entrada (IDLE, WAITING_FOR_INTENT, etc.) não têm timeout.
 PHASE_TIMEOUTS: dict[Phase, float] = {
     Phase.LOCATING_OBJECT:      10.0,
-    Phase.NAVIGATING_TO_TABLE:  20.0,
+    Phase.NAVIGATING_TO_TABLE:  40.0,
     Phase.GRASPING_OBJECT:      15.0,
     Phase.NAVIGATING_TO_PERSON: 20.0,
-    Phase.DELIVERING:           10.0,
+    Phase.DELIVERING:           40.0,
 }
 
-TABLE_LOCATION_NAME   = "table"   # nome da localização SLAM para a mesa
-LIP_MOVEMENT_MIN_CONF = 0.5       # confiança mínima para deteção de pessoa por lábios
+TABLE_LOCATION_NAME   = "table"   
+LIP_MOVEMENT_MIN_CONF = 0.5       
 
 
 # ─── Mapeamento Fase → Módulos Activos ───────────────────────────────────────
-#
-# Quando o orquestrador entra numa fase, publica rt/orchestration/state
-# com este ActiveModules. Cada módulo verifica o seu próprio campo —
-# se for False, ignora dados de entrada e não processa nada.
-#
-# Nota: o campo 'motion' refere-se ao módulo de locomoção (cmd_vel).
-# O braço é sempre controlado pelo módulo de grasping.
 
 PHASE_MODULES: dict[Phase, ActiveModules] = {
     Phase.IDLE: ActiveModules(
@@ -80,11 +70,11 @@ PHASE_MODULES: dict[Phase, ActiveModules] = {
         navigation=False, grasping=False, motion=False,
     ),
     Phase.NAVIGATING_TO_TABLE: ActiveModules(
-        vision_objects=True,  vision_persons=False,
+        vision_objects=False,  vision_persons=False,
         navigation=True,  grasping=False, motion=True,
     ),
     Phase.GRASPING_OBJECT: ActiveModules(
-        vision_objects=False, vision_persons=True,
+        vision_objects=True, vision_persons=False,
         navigation=False, grasping=True,  motion=False,
     ),
     Phase.NAVIGATING_TO_PERSON: ActiveModules(
@@ -110,23 +100,16 @@ PHASE_MODULES: dict[Phase, ActiveModules] = {
 
 @dataclass
 class OrchestratorContext:
-    # Intent actual recebido do HMI
     current_intent:    Optional[Intent] = None
 
-    # Último objecto detectado pela visão (pose 6-DOF usada pelo grasping)
     last_object_pose: Optional[Pose6DOF] = None
     last_object_name: str                = ""
+    
+    object_in_hand:    bool              = False
 
-    # Última pessoa detetada por movimento dos lábios
     last_person_id:    str              = ""
-
-    # Localizações conhecidas do SLAM (actualizadas em background)
     known_locations:   Optional[Locations] = None
-
-    # Fase que originou a recuperação — usada por RECOVERING para saber onde voltar
     last_failed_phase: Optional[Phase] = None
-
-    # Contadores de retry por fase (reset ao completar tarefa com sucesso)
     retry_counts: dict = field(default_factory=lambda: {p: 0 for p in Phase})
 
 
@@ -187,6 +170,14 @@ class Orchestrator:
             old_phase              = self._phase
             self._phase            = new_phase
             self._phase_start_time = time.time()
+            
+            # Flush de buffers dependendo da transição para evitar leitura stale (Fix final)
+            if new_phase in (Phase.DELIVERING, Phase.GRASPING_OBJECT):
+                self._r_grasp_status.take()
+            elif new_phase == Phase.LOCATING_OBJECT:
+                self._r_vision_obj.take()
+            elif new_phase in (Phase.NAVIGATING_TO_TABLE, Phase.NAVIGATING_TO_PERSON):
+                self._r_nav_status.take()
 
         log.info("%-25s → %-25s  (%s)", old_phase.name, new_phase.name, reason)
 
@@ -221,28 +212,20 @@ class Orchestrator:
 
         if phase == Phase.IDLE:
             self._transition(Phase.WAITING_FOR_INTENT, "pronto")
-
         elif phase == Phase.WAITING_FOR_INTENT:
             self._handle_waiting_for_intent()
-
         elif phase == Phase.LOCATING_OBJECT:
             self._handle_locating_object()
-
         elif phase == Phase.NAVIGATING_TO_TABLE:
             self._handle_nav_to_table()
-
         elif phase == Phase.GRASPING_OBJECT:
             self._handle_grasp_status()
-
         elif phase == Phase.NAVIGATING_TO_PERSON:
             self._handle_nav_to_person()
-
         elif phase == Phase.DELIVERING:
             self._handle_delivering()
-
         elif phase == Phase.RECOVERING:
             self._handle_recovering()
-
         elif phase == Phase.ABORTED:
             self._handle_aborted()
 
@@ -258,10 +241,12 @@ class Orchestrator:
         log.info("Intent recebido → acao=%s  alvo='%s'  comando_grasping='%s'",
                  sample.acao.name, sample.alvo, sample.comando_grasping)
 
+        # TODO: A lógica de RECOLHER está mapeada exatamente igual à de ENTREGAR por agora.
+        # Ajustar futuramente conforme os requisitos operacionais da ação RECOLHER.
         if sample.acao in (Acao.ENTREGAR, Acao.RECOLHER):
             self._ctx.last_object_name  = sample.alvo
             self._ctx.last_object_pose = None
-            # 1º PASSO: Navegar para a mesa PRIMEIRO
+            self._ctx.object_in_hand = False
             self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
             self._transition(Phase.NAVIGATING_TO_TABLE,
                              f"a navegar para '{TABLE_LOCATION_NAME}' (buscar '{sample.alvo}')")
@@ -288,7 +273,6 @@ class Orchestrator:
         elif sample.acao == Acao.PARAR:
             self._transition(Phase.IDLE, "paragem solicitada pelo operador")
 
-
     def _handle_nav_to_table(self) -> None:
 
         sample = self._read_one(self._r_nav_status)
@@ -296,7 +280,6 @@ class Orchestrator:
             return
 
         if sample.status == Status.DONE:
-            # 2º PASSO: Chegou à mesa — AGORA transita para localizar o objeto com a visão
             log.info("Chegou à mesa — a iniciar localização de '%s'",
                      self._ctx.last_object_name)
             self._transition(Phase.LOCATING_OBJECT,
@@ -304,7 +287,6 @@ class Orchestrator:
 
         elif sample.status == Status.FAILED:
             self._handle_retry(self._phase, sample.reason)
-
 
     def _handle_locating_object(self) -> None:
 
@@ -319,7 +301,6 @@ class Orchestrator:
                 self._ctx.last_object_pose = det.pose
                 log.info("Objecto '%s' localizado (conf=%.2f)", det.name, det.confidence)
 
-                # 3º PASSO: Objeto localizado — mandar o braço agarrar!
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto=self._ctx.last_object_name,
@@ -332,7 +313,6 @@ class Orchestrator:
                 return
 
     def _handle_grasp_status(self) -> None:
-        """Usado nas fases GRASPING_OBJECT e DELIVERING — ambas lêem rt/grasp/status."""
 
         sample = self._read_one(self._r_grasp_status)
         if sample is None:
@@ -341,7 +321,9 @@ class Orchestrator:
         if sample.status == Status.DONE:
 
             if self._phase == Phase.GRASPING_OBJECT:
-                # Objeto agarrado — braço em postura de transporte (mão fechada)
+                # Regista que objeto está efetivamente na mão
+                self._ctx.object_in_hand = True
+                
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto=self._ctx.last_object_name,
@@ -350,7 +332,6 @@ class Orchestrator:
                     postura=Posture.EXTEND_ARM_FORWARD,
                 ))
 
-                # Navega até à pessoa identificada pelos lábios
                 goal = self._build_person_goal()
                 if goal:
                     self._w_nav_goal.write(goal)
@@ -364,7 +345,6 @@ class Orchestrator:
 
             elif self._phase == Phase.DELIVERING:
                 if sample.reason == 'deliver_done':
-                    # Braço estendido, mão aberta — pedir retracção e aguardar
                     self._w_grasp_cmd.write(GraspCommand(
                         header=self._make_header(),
                         objeto=self._ctx.last_object_name,
@@ -374,16 +354,14 @@ class Orchestrator:
                     ))
                     log.info("Objeto '%s' entregue — a recolher braço (aguardar drop_done)...",
                              self._ctx.last_object_name)
-                    # Permanece em DELIVERING à espera do próximo DONE (drop_done)
 
                 elif sample.reason in ('drop_done', ''):
-                    # Braço completamente recolhido — seguro avançar
+                    self._ctx.object_in_hand = False
                     log.info("Braço recolhido — tarefa concluída.")
                     self._ctx.retry_counts = {p: 0 for p in Phase}
                     self._transition(Phase.IDLE, "tarefa concluída")
 
                 else:
-                    # reason desconhecido mas status DONE — aceitar e concluir
                     log.warning("DELIVERING DONE com reason inesperado '%s' — a concluir.",
                                 sample.reason)
                     self._ctx.retry_counts = {p: 0 for p in Phase}
@@ -401,12 +379,10 @@ class Orchestrator:
         if sample.status == Status.DONE:
             intent = self._ctx.current_intent
             if intent and intent.acao == Acao.SEGUIR:
-                # Modo SEGUIR — chegou à pessoa sem objeto; não há entrega
                 log.info("Chegou à pessoa '%s' (modo SEGUIR — sem entrega)",
                          self._ctx.last_person_id)
                 self._transition(Phase.IDLE, "chegou à pessoa (SEGUIR)")
             else:
-                # Modo ENTREGAR / RECOLHER — estender braço e entregar objeto
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
                     objeto=self._ctx.last_object_name,
@@ -422,14 +398,13 @@ class Orchestrator:
             self._handle_retry(self._phase, sample.reason)
 
     def _handle_delivering(self) -> None:
-        """DELIVERING aguarda confirmação do grasping — reutiliza _handle_grasp_status."""
+        
         self._handle_grasp_status()
 
     def _handle_recovering(self) -> None:
 
         if self._recover_until is None:
-            # Se o robô tiver o objeto na mão, largar antes de recuperar
-            if self._ctx.last_object_pose is not None:
+            if self._ctx.object_in_hand:
                 log.warning("A largar objeto antes de recuperar...")
                 self._w_grasp_cmd.write(GraspCommand(
                     header=self._make_header(),
@@ -438,6 +413,8 @@ class Orchestrator:
                     pose=Pose6DOF(),
                     postura=Posture.NEUTRAL,
                 ))
+                self._ctx.object_in_hand = False
+                
             self._recover_until = time.time() + 3.0
             log.warning("A recuperar de erro — aguarda 3 s...")
             return
@@ -448,25 +425,26 @@ class Orchestrator:
             failed = self._ctx.last_failed_phase
 
             if failed == Phase.NAVIGATING_TO_TABLE:
-                # Falhou a caminho da mesa — renavegar
                 log.info("A reenviar NavGoal para a mesa após recuperação")
                 self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
                 self._transition(Phase.NAVIGATING_TO_TABLE,
                                  "a tentar navegar para a mesa novamente")
 
             elif failed in (Phase.LOCATING_OBJECT, Phase.GRASPING_OBJECT):
-                # Falhou já junto à mesa — relocalizar (não navegar de novo)
                 self._transition(Phase.LOCATING_OBJECT,
                                  "a relocalizar objeto junto à mesa")
 
             elif failed == Phase.NAVIGATING_TO_PERSON:
-                # Falhou a caminho da pessoa, objeto foi largado — missão comprometida
                 log.error("Falha a caminho da pessoa — objeto largado. A abortar missão.")
                 self._transition(Phase.ABORTED,
                                  "falha a caminho da pessoa — objeto largado")
 
+            elif failed == Phase.DELIVERING:
+                log.error("Falha durante a entrega do objeto — objeto largado. A abortar missão.")
+                self._transition(Phase.ABORTED, 
+                                 "falha na entrega final")
+
             else:
-                # Fallback seguro para fases não mapeadas
                 log.warning("Fase de falha não mapeada (%s) — a tentar desde a mesa",
                             failed.name if failed else "None")
                 self._w_nav_goal.write(self._make_named_goal(TABLE_LOCATION_NAME))
@@ -487,7 +465,7 @@ class Orchestrator:
 
     def _handle_retry(self, failed_phase: Phase, reason: str) -> None:
 
-        self._ctx.last_failed_phase = failed_phase   # RECOVERING usa para decidir para onde voltar
+        self._ctx.last_failed_phase = failed_phase   
         self._ctx.retry_counts[failed_phase] += 1
         attempts = self._ctx.retry_counts[failed_phase]
 
