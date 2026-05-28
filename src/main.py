@@ -45,7 +45,7 @@ VISION_MIN_CONF  = 0.6
 PHASE_TIMEOUTS: dict[Phase, float] = {
     Phase.LOCATING_OBJECT:       10.0,
     Phase.NAVIGATING_TO_TABLE:   40.0,
-    Phase.GRASPING_OBJECT:       15.0,
+    Phase.GRASPING_OBJECT:       60.0,
     Phase.BACKING_UP_FROM_TABLE: 5.0,    # <--- Timeout de segurança para o recuo
     Phase.NAVIGATING_TO_PERSON:  20.0,
     Phase.DELIVERING:            40.0,
