@@ -74,24 +74,25 @@ class Acao(IdlEnum):
     LARGA    = auto()
 
 
-@dataclass
-class Intent(IdlStruct, typename="rt.hmi.Intent"):
-    header:           Header = field(default_factory=Header)
-    acao:             Acao   = Acao.ENTREGAR
-    alvo:             str    = ""
-    comando_grasping: str    = ""
-
-
 class OrchestrationState(IdlEnum):
     IDLE                 = auto()
     WAITING_FOR_INTENT   = auto()
     LOCATING_OBJECT      = auto()
     NAVIGATING_TO_TABLE  = auto()
     GRASPING_OBJECT      = auto()
+    BACKING_UP_FROM_TABLE= auto()  # <--- Adicionado para controlo de recuo
     NAVIGATING_TO_PERSON = auto()
     DELIVERING           = auto()
     RECOVERING           = auto()
     ABORTED              = auto()
+
+
+@dataclass
+class Intent(IdlStruct, typename="rt.hmi.Intent"):
+    header:           Header = field(default_factory=Header)
+    acao:             Acao   = Acao.ENTREGAR
+    alvo:             str    = ""
+    comando_grasping: str    = ""
 
 
 @dataclass
@@ -245,6 +246,7 @@ class Phase(IdlEnum):
     LOCATING_OBJECT      = auto()
     NAVIGATING_TO_TABLE  = auto()
     GRASPING_OBJECT      = auto()
+    BACKING_UP_FROM_TABLE= auto()  # <--- Adicionado para controlo de recuo
     NAVIGATING_TO_PERSON = auto()
     DELIVERING           = auto()
     RECOVERING           = auto()

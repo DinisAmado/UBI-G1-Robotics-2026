@@ -12,7 +12,7 @@ from cyclonedds.sub import Subscriber, DataReader
 from qos_profiles import (
     QOS_HMI, QOS_ORCHESTRATION, QOS_HEARTBEAT,
     QOS_VISION, QOS_SLAM_MAP,
-    QOS_NAV, QOS_GRASP,
+    QOS_NAV, QOS_GRASP, QOS_MOTION
 )
 
 from idl_ri import (
@@ -22,7 +22,7 @@ from idl_ri import (
     NavGoal as Goal, GoalType, GoalData, NavStatusMsg as NavStatus,
     GraspCommand, GraspStatusMsg as GraspStatus, Posture,
     Objects as VisionObjects, Persons as VisionPersons,
-    Locations,
+    Locations, CmdVel
 )
 
 
@@ -43,11 +43,12 @@ LOOP_HZ          = 20
 VISION_MIN_CONF  = 0.6    
 
 PHASE_TIMEOUTS: dict[Phase, float] = {
-    Phase.LOCATING_OBJECT:      10.0,
-    Phase.NAVIGATING_TO_TABLE:  40.0,
-    Phase.GRASPING_OBJECT:      15.0,
-    Phase.NAVIGATING_TO_PERSON: 20.0,
-    Phase.DELIVERING:           40.0,
+    Phase.LOCATING_OBJECT:       10.0,
+    Phase.NAVIGATING_TO_TABLE:   40.0,
+    Phase.GRASPING_OBJECT:       15.0,
+    Phase.BACKING_UP_FROM_TABLE: 5.0,    # <--- Timeout de segurança para o recuo
+    Phase.NAVIGATING_TO_PERSON:  20.0,
+    Phase.DELIVERING:            40.0,
 }
 
 TABLE_LOCATION_NAME   = "table"   
@@ -76,6 +77,10 @@ PHASE_MODULES: dict[Phase, ActiveModules] = {
     Phase.GRASPING_OBJECT: ActiveModules(
         vision_objects=True, vision_persons=False,
         navigation=False, grasping=True,  motion=False,
+    ),
+    Phase.BACKING_UP_FROM_TABLE: ActiveModules(  # <--- Navegação desligada, motion ligado
+        vision_objects=False, vision_persons=False,
+        navigation=False, grasping=False, motion=True,
     ),
     Phase.NAVIGATING_TO_PERSON: ActiveModules(
         vision_objects=False, vision_persons=True,
@@ -144,6 +149,7 @@ class Orchestrator:
         t_vision_obj   = Topic(self._dp, "rt/vision/objects",          VisionObjects,     qos=QOS_VISION)
         t_vision_per   = Topic(self._dp, "rt/vision/persons",          VisionPersons,     qos=QOS_VISION)
         t_slam_locs    = Topic(self._dp, "rt/slam/locations",          Locations,         qos=QOS_SLAM_MAP)
+        t_cmd_vel      = Topic(self._dp, "rt/motion/cmd_vel",          CmdVel,            qos=QOS_MOTION) # <--- Tópico adicionado
 
         # ── Writers ────────────────────────────────────────────────────────
         self._w_orch_state   = DataWriter(pub, t_orch_state)
@@ -151,6 +157,7 @@ class Orchestrator:
         self._w_hmi_feedback = DataWriter(pub, t_hmi_feedback)
         self._w_nav_goal     = DataWriter(pub, t_nav_goal)
         self._w_grasp_cmd    = DataWriter(pub, t_grasp_cmd)
+        self._w_cmd_vel      = DataWriter(pub, t_cmd_vel) # <--- Writer adicionado
 
         # ── Readers ────────────────────────────────────────────────────────
         self._r_hmi_intent   = DataReader(sub, t_hmi_intent)
@@ -220,6 +227,8 @@ class Orchestrator:
             self._handle_nav_to_table()
         elif phase == Phase.GRASPING_OBJECT:
             self._handle_grasp_status()
+        elif phase == Phase.BACKING_UP_FROM_TABLE: # <--- Redirecionamento adicionado
+            self._handle_backing_up_from_table()
         elif phase == Phase.NAVIGATING_TO_PERSON:
             self._handle_nav_to_person()
         elif phase == Phase.DELIVERING:
@@ -241,8 +250,6 @@ class Orchestrator:
         log.info("Intent recebido → acao=%s  alvo='%s'  comando_grasping='%s'",
                  sample.acao.name, sample.alvo, sample.comando_grasping)
 
-        # TODO: A lógica de RECOLHER está mapeada exatamente igual à de ENTREGAR por agora.
-        # Ajustar futuramente conforme os requisitos operacionais da ação RECOLHER.
         if sample.acao in (Acao.ENTREGAR, Acao.RECOLHER):
             self._ctx.last_object_name  = sample.alvo
             self._ctx.last_object_pose = None
@@ -321,7 +328,6 @@ class Orchestrator:
         if sample.status == Status.DONE:
 
             if self._phase == Phase.GRASPING_OBJECT:
-                # Regista que objeto está efetivamente na mão
                 self._ctx.object_in_hand = True
                 
                 self._w_grasp_cmd.write(GraspCommand(
@@ -332,16 +338,8 @@ class Orchestrator:
                     postura=Posture.EXTEND_ARM_FORWARD,
                 ))
 
-                goal = self._build_person_goal()
-                if goal:
-                    self._w_nav_goal.write(goal)
-                    self._transition(Phase.NAVIGATING_TO_PERSON,
-                                     f"a navegar para '{self._ctx.last_person_id}'"
-                                     if self._ctx.last_person_id else "a navegar para pessoa")
-                else:
-                    log.error("Não foi possível localizar a pessoa nas localizações SLAM.")
-                    self._handle_retry(Phase.NAVIGATING_TO_PERSON,
-                                       "pessoa não encontrada no SLAM")
+                # Em vez de ir direto para a navegação, salta para o recuo manual
+                self._transition(Phase.BACKING_UP_FROM_TABLE, "a afastar da mesa após grasping")
 
             elif self._phase == Phase.DELIVERING:
                 if sample.reason == 'deliver_done':
@@ -369,6 +367,38 @@ class Orchestrator:
 
         elif sample.status == Status.FAILED:
             self._handle_retry(self._phase, sample.reason)
+
+    def _handle_backing_up_from_table(self) -> None:
+        """Envia velocidades hardcoded para trás sem interferência do move_base/nav."""
+        elapsed = time.time() - self._phase_start_time
+
+        if elapsed < 2.5: # Executa o recuo durante 2.5 segundos
+            self._w_cmd_vel.write(CmdVel(
+                header=self._make_header(),
+                vx=-0.2, # Velocidade linear negativa para recuar linearmente
+                vy=0.0,
+                wz=0.0
+            ))
+        else:
+            # Força a imobilização antes de devolver o controlo à navegação automática
+            self._w_cmd_vel.write(CmdVel(
+                header=self._make_header(),
+                vx=0.0, vy=0.0, wz=0.0
+            ))
+            
+            log.info("Afastamento da mesa concluído. A iniciar navegação.")
+
+            # Constrói e envia o objetivo para localizar a pessoa
+            goal = self._build_person_goal()
+            if goal:
+                self._w_nav_goal.write(goal)
+                self._transition(Phase.NAVIGATING_TO_PERSON,
+                                 f"a navegar para '{self._ctx.last_person_id}'"
+                                 if self._ctx.last_person_id else "a navegar para pessoa")
+            else:
+                log.error("Não foi possível localizar a pessoa nas localizações SLAM.")
+                self._handle_retry(Phase.NAVIGATING_TO_PERSON,
+                                   "pessoa não encontrada no SLAM")
 
     def _handle_nav_to_person(self) -> None:
 
@@ -520,6 +550,7 @@ class Orchestrator:
             Phase.LOCATING_OBJECT:      HmiState.LOCATING_OBJECT,
             Phase.NAVIGATING_TO_TABLE:  HmiState.NAVIGATING_TO_TABLE,
             Phase.GRASPING_OBJECT:      HmiState.GRASPING_OBJECT,
+            Phase.BACKING_UP_FROM_TABLE:HmiState.BACKING_UP_FROM_TABLE, # <--- Mapeamento adicionado
             Phase.NAVIGATING_TO_PERSON: HmiState.NAVIGATING_TO_PERSON,
             Phase.DELIVERING:           HmiState.DELIVERING,
             Phase.RECOVERING:           HmiState.RECOVERING,
